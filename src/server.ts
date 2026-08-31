@@ -179,6 +179,16 @@ export function createTikTokServer(options: TikTokServerOptions = {}): McpServer
     inputSchema: { account_id: ACCOUNT_ID, video_url: z.string().url() },
   }, (args) => runtime.like(args as any));
 
+  addTool(server, "tiktok_comment", {
+    title: "Comment on a TikTok video",
+    description: "Post a comment on another user's video from a connected local profile. Verified by read-back of the published comment.",
+    inputSchema: {
+      account_id: ACCOUNT_ID,
+      video_url: z.string().url().describe("Full TikTok video URL, e.g. https://www.tiktok.com/@handle/video/1234567890"),
+      comment: z.string().min(1).max(2200).describe("The comment text to publish"),
+    },
+  }, (args) => runtime.comment(args as any));
+
   addTool(server, "tiktok_comment_reply", {
     title: "Reply to a comment",
     description: "Reply to a comment in TikTok Studio's web Comment Management. Locates the comment by its text and posts a text reply, verified by read-back of the posted reply.",

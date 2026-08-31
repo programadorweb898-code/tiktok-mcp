@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
   analyzePosts,
+  commentOnVideo,
   commentReply,
   deleteVideo,
   followUser,
@@ -344,6 +345,14 @@ export class LocalTikTokRuntime {
    */
   commentReply(input: { account_id: string; comment_text: string; reply: string }) {
     return this.start("comment", input.account_id, input, (common) => commentReply({ ...common, ...input }));
+  }
+
+  /**
+   * Post a comment on another user's video (the watch page, not Studio). A
+   * browser action; verifies the published comment by read-back.
+   */
+  comment(input: { account_id: string; video_url: string; comment: string }) {
+    return this.start("comment", input.account_id, input, (common) => commentOnVideo({ ...common, ...input }));
   }
 
   /**

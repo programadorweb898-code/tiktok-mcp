@@ -50,7 +50,7 @@ El sistema combina: MCP (stdio), Playwright con perfiles de navegador persistent
 ```
 Agente MCP (Claude Code, Codex, Hermes, …)
         ↓  stdio (JSON-RPC)
-src/server.ts            — definición y validación de las 25 tools MCP
+src/server.ts            — definición y validación de las 26 tools MCP
         ↓
 LocalTikTokRuntime       — src/runtime/local-runtime.ts
         ↓                (operaciones asíncronas + registro de jobs)
@@ -69,7 +69,7 @@ TikTok (web + TikTok Studio)
 | Archivo | Responsabilidad |
 |---|---|
 | `src/index.ts` | Entrypoint binario (`tiktok-mcp`). Flags: `--data-dir`, `--browser-path`, `--headless`. Transporte stdio. |
-| `src/server.ts` | Registro de las 25 tools con esquemas zod, wrapper `addTool` con captura de errores y devolución estructurada (`structuredContent` + texto JSON). |
+| `src/server.ts` | Registro de las 26 tools con esquemas zod, wrapper `addTool` con captura de errores y devolución estructurada (`structuredContent` + texto JSON). |
 | `src/runtime/local-runtime.ts` | Orquestador. Crea operaciones asíncronas (`pending → running → done/failed/cancelled`), gestiona el flujo de conexión QR, delega en las operaciones. |
 | `src/runtime/tiktok-operations.ts` | Implementación real de cada operación contra TikTok: subida de video, follow, like, delete, perfil, avatar, scraping de analíticas. Incluye helpers de diagnóstico, modales, privacidad, scheduling nativo e interceptor de respuestas API. |
 | `src/runtime/media-mix.ts` | Fusión local de media con `ffmpeg-static` (binario incluido): reemplaza o superpone una pista de audio sobre un video y produce un MP4 listo para `tiktok_post`. |
@@ -90,7 +90,7 @@ TikTok (web + TikTok Studio)
 
 ### Modelo de ejecución
 
-Las tools de acción (`post`, `follow`, `like`, `delete`, `profile`, `avatar`, `analytics`, `cancel_scheduled`) son **asíncronas**: devuelven inmediatamente `{ operation_id, status: "pending", poll_with: "tiktok_operation_status" }` y el agente consulta el resultado con `tiktok_operation_status`. Las tools de lectura (`accounts`, `series`, `hooks`, `niches`, `scheduled`, `connect_status`) son síncronas. `tiktok_mix_media` es síncrona y de procesamiento local (no abre navegador): devuelve el MP4 fusionado.
+Las tools de acción (`post`, `follow`, `like`, `comment`, `delete`, `profile`, `avatar`, `analytics`, `cancel_scheduled`) son **asíncronas**: devuelven inmediatamente `{ operation_id, status: "pending", poll_with: "tiktok_operation_status" }` y el agente consulta el resultado con `tiktok_operation_status`. Las tools de lectura (`accounts`, `series`, `hooks`, `niches`, `scheduled`, `connect_status`) son síncronas. `tiktok_mix_media` es síncrona y de procesamiento local (no abre navegador): devuelve el MP4 fusionado.
 
 Solo puede haber **una sesión de navegador abierta por cuenta a la vez**: `lockAccount()` serializa los accesos al perfil persistente.
 
@@ -98,7 +98,7 @@ Solo puede haber **una sesión de navegador abierta por cuenta a la vez**: `lock
 
 ## 4. Capacidades actuales (tools MCP)
 
-Verificado contra `src/server.ts`. El servidor expone exactamente 25 tools (el test lo afirma).
+Verificado contra `src/server.ts`. El servidor expone exactamente 26 tools (el test lo afirma).
 
 | Tool | Propósito | Parámetros principales | Implementación | Browser/API | Estado | Limitaciones conocidas |
 |---|---|---|---|---|---|---|
@@ -112,6 +112,7 @@ Verificado contra `src/server.ts`. El servidor expone exactamente 25 tools (el t
 | `tiktok_operation_status` | Consultar job asíncrono | `operation_id` | Lectura del registro de operaciones | — | IMPLEMENTADO | Los registros se podan a 2.000 operaciones |
 | `tiktok_follow` | Seguir usuario | `account_id`, `target_user` | Perfil público; probe de hidratación de acciones; intercepta `commit/follow/user` o `passport/web/user/follow`; fallback: flip del botón; "ya siguiendo" es éxito legítimo | Browser + intercepción API interna | IMPLEMENTADO | Perfiles privados/restringidos pueden no exponer control |
 | `tiktok_like` | Dar like a un video | `account_id`, `video_url` | Página watch; probe de hidratación del rail; intercepta `commit/item/digg` | Browser + intercepción API interna | IMPLEMENTADO | Requiere permalink `/video/<id>` |
+| `tiktok_comment` | Comentar en el video de otro usuario | `account_id`, `video_url`, `comment` (1-2200) | Visita el permalink `/video/<id>`; espera el rail de engagement hidratado; resuelve el campo de comentario (data-e2e → placeholder → editor) y abre el rail vía el icono de comentarios si es lazy; escribe y envía con Enter; verifica por read-back (el campo se vacía Y el texto aparece publicado) | Browser | IMPLEMENTADO (v1; requiere validación manual) | El DOM del watch page no se pudo inspeccionar en desarrollo → selectores resilientes + read-back; nunca reporta éxito sin observar el comentario publicado (si queda dudoso devuelve `UI_TIMEOUT` y pide verificar antes de reenviar) |
 | `tiktok_delete` | Eliminar video propio | `account_id`, `video_url` | Studio content manager; menú "…" → Delete → confirmar; verificación por reload (la fila ya no existe) | Browser | IMPLEMENTADO | Si el post está en otra página del listado puede reportarse `NOT_FOUND` |
 | `tiktok_update_profile` | Actualizar nombre/bio | `account_id`, `display_name?`, `bio?` | Modal "Edit profile"; Save deshabilitado = no-op exitoso; read-back del título para detectar rechazo silencioso de nickname (cooldown semanal) | Browser | IMPLEMENTADO | Cambio de nickname limitado por TikTok (~1 vez/semana) |
 | `tiktok_update_avatar` | Actualizar foto de perfil | `account_id`, `image_path/image_url/image_base64` (exactamente uno) | Modal "Edit profile" + input file + diálogo de crop; verificación: URL del avatar cambia tras reload | Browser | IMPLEMENTADO | Imágenes ≤10 MB; png/jpeg/webp |
@@ -170,8 +171,8 @@ Estados: `IMPLEMENTED` · `PARTIAL` · `PLANNED` · `RESEARCH` · `BLOCKED` · `
 | unlike | RESEARCH | — |
 | follow | IMPLEMENTED | `tiktok_follow` |
 | unfollow | RESEARCH | — |
-| comment | PLANNED | Fase 2 |
-| reply | PLANNED | Fase 2 |
+| comment | PARTIAL (v1) | `tiktok_comment` publica un comentario en el video de otro usuario (watch page), verificado por read-back. El DOM del watch page no se inspeccionó en desarrollo → selectores resilientes + validación manual pendiente |
+| reply | PLANNED | Fase 2 (ya existe `tiktok_comment_reply` como "responder comentarios" en Analytics/Studio) |
 | delete comment | PLANNED | Fase 2 |
 | leer comentarios | PLANNED | Fase 2 |
 | share | RESEARCH | — |
@@ -326,7 +327,7 @@ Separación estricta entre datos observados de TikTok y cálculo local:
 
 Actual (`npm test` = build + `node --test dist/tests/local.test.js`, framework `node:test`):
 
-- Unitarios/integración local: persistencia de cuentas y muestras de analíticas (recordSample dedup, series, latest), contrato de las 25 tools vía `InMemoryTransport` (nombres, ausencia de campos de pago, llamada a `tiktok_niches`), arranque real del binario empaquetado por stdio, contrato HTTP del cliente QR relay (con fetch inyectado). La fusión de media (`tiktok_mix_media`), el quiz visual (`tiktok_make_quiz`) y el duet/stitch (`tiktok_make_duet`) se validan con una ejecución manual real de `ffmpeg` sobre archivos de prueba; no hay test automatizado del binario. `tiktok_monetization_status` se implementó sin poder inspeccionar el DOM real (requiere cuenta apta autenticada): su validación final es manual. Igual para `tiktok_comment_reply`, que depende del DOM de Comment Management (requiere una cuenta con comentarios): validación final manual. `tiktok_pin_video`, que depende del menú de acciones del video, también requiere validación manual contra una cuenta real. `tiktok_playlist_manage` comparte la misma situación: solo está disponible para cuentas con 10k+ seguidores, así que su validación final es manual contra una cuenta apta. `tiktok_search` también se implementó sin inspeccionar el DOM de resultados en desarrollo (búsqueda pública): se lee por links reales + texto visible y su validación final es manual.
+- Unitarios/integración local: persistencia de cuentas y muestras de analíticas (recordSample dedup, series, latest), contrato de las 26 tools vía `InMemoryTransport` (nombres, ausencia de campos de pago, llamada a `tiktok_niches`), arranque real del binario empaquetado por stdio, contrato HTTP del cliente QR relay (con fetch inyectado). La fusión de media (`tiktok_mix_media`), el quiz visual (`tiktok_make_quiz`) y el duet/stitch (`tiktok_make_duet`) se validan con una ejecución manual real de `ffmpeg` sobre archivos de prueba; no hay test automatizado del binario. `tiktok_monetization_status` se implementó sin poder inspeccionar el DOM real (requiere cuenta apta autenticada): su validación final es manual. Igual para `tiktok_comment_reply`, que depende del DOM de Comment Management (requiere una cuenta con comentarios): validación final manual. `tiktok_pin_video`, que depende del menú de acciones del video, también requiere validación manual contra una cuenta real. `tiktok_playlist_manage` comparte la misma situación: solo está disponible para cuentas con 10k+ seguidores, así que su validación final es manual contra una cuenta apta. `tiktok_search` también se implementó sin inspeccionar el DOM de resultados en desarrollo (búsqueda pública): se lee por links reales + texto visible y su validación final es manual. `tiktok_comment` comparte la situación del watch page (DOM de comentarios no inspeccionado en desarrollo): selectores resilientes + read-back, validación final manual contra una cuenta real.
 - **No existen tests de browser contra TikTok real automatizados.**
 
 Estrategia definida:
@@ -379,7 +380,7 @@ Estrategia definida:
 | Fase | Alcance | Estado |
 |---|---|---|
 | 1 | Estabilizar el MCP existente: comprender la arquitectura, pruebas, endurecer selectores y errores | En curso |
-| 2 | Completar engagement: unlike/unfollow, comentarios (leer, escribir, responder, borrar) | Planificado |
+| 2 | Completar engagement: unlike/unfollow, comentarios (leer, escribir, responder, borrar) | En curso (escribir comentarios implementado `tiktok_comment`; response en Studio `tiktok_comment_reply`; leer/unlike/unfollow/borrar pendientes) |
 | 3 | Discovery y trends: búsquedas (videos/usuarios/hashtags), tendencias, sounds | En curso (búsqueda implementada `tiktok_search`; tendencias/sounds pendientes) |
 | 4 | Analytics avanzados: analíticas de perfil, métricas profundas de Studio, histórico más rico | Planificado |
 | 5 | LIVE: descubrimiento, información e interacción | Planificado |
@@ -511,6 +512,18 @@ Decisión: implementar `tiktok_search` (`type: "video" | "user" | "hashtag"`) na
 Motivo: la búsqueda es la capacidad más fundamental de la Fase 3 y es pública en la web. Se prioriza la honestidad (solo lo observado) y la reutilización de patrones existentes de scrape defensivo, sin inventar selectores ni endpoints.
 Alternativas consideradas: imponer cuenta obligatoria (rechazado: la búsqueda es pública y debe funcionar sin login); interceptar el endpoint interno de búsqueda (rechazado: no se inventa sin observar).
 Consecuencias: `account_id` es opcional; la tool usa un perfil anónimo (`__search__`) cuando no hay cuenta. El DOM de resultados no se inspeccionó en desarrollo → validación manual pendiente. Conteo pasa de 23 a 24 tools.
+
+---
+
+## DEC-012 — Comentar en videos de otros desde el watch page con verificación por read-back
+
+Fecha: 2026-08-30
+
+Estado: Aceptada (implementada v1, validación manual pendiente)
+Decisión: implementar `tiktok_comment` para publicar un comentario en el video de otro usuario navegando al permalink `/video/<id>`, esperando el rail de engagement hidratado, resolviendo el campo de comentario con selectores resilientes (data-e2e → placeholder → editor) y abriendo el rail vía el icono de comentarios si el campo es lazy. Se escribe el texto y se envía con Enter. La verificación es por read-back estricto: el campo queda vacío Y el texto aparece publicado en el DOM; si no se confirma, devuelve `UI_TIMEOUT` con diagnóstico y advierte que no se reenvíe sin verificar.
+Motivo: la interacción social de comentar en videos ajenos es la capacidad más común que faltaba del espectro de engagement; el watch page expone el campo de comentario y TikTok lo publica vía la UI, lo que permite verificación honesta por read-back sin inventar endpoints internos.
+Alternativas consideradas: interceptar el endpoint interno de publicación de comentarios (rechazado: no se inventa sin observar); reutilizar Comment Management de Studio (rechazado: solo gestiona comentarios recibidos, no comentar en videos ajenos).
+Consecuencias: la tool es asíncrona (`comment`), comparte la ventana de rate limit de "comment" con `tiktok_comment_reply` (20/hora) y exige permalink `/video/<id>`. El DOM del watch page no se pudo inspeccionar en desarrollo → selectores resilientes + validación manual pendiente. Conteo pasa de 25 a 26 tools.
 
 ---
 

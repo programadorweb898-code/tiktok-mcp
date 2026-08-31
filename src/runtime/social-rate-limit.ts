@@ -7,6 +7,7 @@ const WINDOWS: Array<{ operations: string[]; windowMs: number; max: number }> = 
   { operations: ["post"], windowMs: 24 * 60 * 60 * 1000, max: 3 },
   { operations: ["follow"], windowMs: 60 * 60 * 1000, max: 20 },
   { operations: ["like"], windowMs: 60 * 60 * 1000, max: 60 },
+  { operations: ["comment"], windowMs: 60 * 60 * 1000, max: 20 },
 ];
 
 export function checkRateLimit(accountId: string, _platform: "tiktok", operation: string): RateLimitResult {

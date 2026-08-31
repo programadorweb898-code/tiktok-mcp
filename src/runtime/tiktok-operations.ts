@@ -2142,6 +2142,146 @@ export async function commentReply(req: TikTokCommentRequest): Promise<TikTokOpR
   }
 }
 
+export interface TikTokCommentOnVideoRequest extends TikTokOpRequest {
+  /** The full TikTok video permalink, e.g. https://www.tiktok.com/@handle/video/1234567890. */
+  video_url: string;
+  /** The comment text to publish (1-2200 chars). */
+  comment: string;
+}
+
+/**
+ * Post a comment on another user's video (the watch page, not Studio).
+ *
+ * DRIVE: navigate to the video permalink, focus the comment input and post the
+ * text. VERIFY: the input is drained of the text AND the comment appears in the
+ * page body — the same honest read-back rule as comment/delete: never report
+ * success unless the published text is actually observed.
+ *
+ * LIMITATION: the watch-page comment field cannot be pinned from this dev
+ * environment, so like the other resilient ops it resolves via multi-tier
+ * selectors (data-e2e -> placeholder -> any comment-y editor) and falls back to
+ * opening the comment rail via the comment icon when the field is lazy. Must be
+ * validated manually against a real account.
+ */
+export async function commentOnVideo(req: TikTokCommentOnVideoRequest): Promise<TikTokOpResult<{ commented: boolean; target: string }>> {
+  const blocked = gate(req.account_id, "comment");
+  if (blocked) return blocked;
+
+  if (!/^https:\/\/(www\.)?tiktok\.com\/@[A-Za-z0-9._]+\/video\/\d+/.test(req.video_url)) {
+    return { success: false, error: "video_url must be a TikTok /video/ permalink", error_code: "INVALID_INPUT" };
+  }
+  const comment = (req.comment || "").trim();
+  if (comment.length < 1 || comment.length > 2200) {
+    return { success: false, error: "comment (1-2200 chars) is required", error_code: "INVALID_INPUT" };
+  }
+
+  let session;
+  try {
+    session = await openAuthenticatedSession({
+      accountId: req.account_id,
+      proxySessionId: req.proxy_session_id,
+      cookies: req.cookies,
+      country: req.country,
+    });
+  } catch (e: any) {
+    return { success: false, error: `Failed to open session: ${e.message}`, error_code: "LAUNCH_FAILED" };
+  }
+
+  const { page, close } = session;
+  try {
+    await page.goto(req.video_url, { waitUntil: "domcontentloaded", timeout: 45000 });
+
+    // Same readiness trap as like: the engagement rail hydrates after the
+    // video shell. Gate on the rail before looking for the comment input.
+    const railReady = await waitForHydrated(page, HYDRATION_PROBES.videoActions, { timeoutMs: 30000 });
+    if (!railReady) {
+      const diag = await captureUiState(page, "comment-rail-not-hydrated");
+      return {
+        success: false,
+        error: "The video page loaded but its engagement controls never rendered, so the comment field could not be read into the page.",
+        error_code: "NOT_READY",
+        data: diag as any,
+      };
+    }
+
+    if (await dismissBlockingModal(page, 6000)) console.error("[tiktok] dismissed a modal covering the comment input");
+
+    // Resolve the comment field: try the direct input first; if TikTok only
+    // renders the field after the comment rail opens, fall back to clicking the
+    // comment icon and retrying.
+    const inputStrategies = [
+      { name: "data-e2e-input", build: (p: any) => p.locator('[data-e2e="comment-input"], [data-e2e="comment-textarea"], [data-e2e="comment-send-input"], [data-e2e="comment-reply-input"]') },
+      { name: "placeholder-input", build: (p: any) => p.locator('[data-placeholder*="Add comment" i], textarea[placeholder*="Add comment" i], input[placeholder*="Add comment" i]') },
+      { name: "any-comment-editor", build: (p: any) => p.locator('div[data-e2e*="comment" i] [contenteditable="true"], div[data-e2e*="comment" i] textarea') },
+    ];
+    let input = await resolveElement(page, inputStrategies, { perStrategyMs: 5000, state: "attached" });
+
+    if (!input) {
+      const icon = await resolveElement(page, [
+        { name: "data-e2e-icon", build: (p: any) => p.locator('[data-e2e="comment-icon"], [data-e2e="browse-comment-icon"]') },
+        { name: "aria-comment", build: (p: any) => p.getByRole("button", { name: /comment/i }) },
+      ], { perStrategyMs: 5000 });
+      if (icon) {
+        console.error(`[tiktok] comment input missing — opened the rail via ${icon.strategy}`);
+        await icon.locator.click({ timeout: 6000 });
+        await page.waitForTimeout(1200);
+        input = await resolveElement(page, inputStrategies, { perStrategyMs: 5000, state: "attached" });
+      }
+    }
+
+    if (!input) {
+      const diag = await captureUiState(page, "comment-input-missing");
+      return {
+        success: false,
+        error: "No comment input was found on the video page after it rendered (selector may have rotated).",
+        error_code: "UI_TIMEOUT",
+        data: diag as any,
+      };
+    }
+    console.error(`[tiktok] comment input resolved via ${input.strategy}`);
+
+    await input.locator.click({ timeout: 8000 }).catch(() => {});
+    await input.locator.fill(comment, { timeout: 8000 });
+    await page.keyboard.press("Enter");
+
+    // Verify by read-back: the field must be drained AND the comment text must
+    // be present in the page body. This separates "did it post" from "is my
+    // text still sitting in the box" — the exact distinction that prevents a
+    // false success.
+    const seen = await page
+      .waitForFunction(
+        (needle: string) => {
+          const field = document.querySelector('[data-e2e="comment-input"], [data-e2e="comment-textarea"], [data-e2e="comment-send-input"], textarea, [contenteditable="true"]');
+          const fieldText = field ? String((field as any).value || field.textContent || "") : "";
+          const body = (document.body.textContent || "").replace(/\s+/g, " ");
+          return body.includes(needle) && !fieldText.includes(needle);
+        },
+        comment,
+        { timeout: 15000 },
+      )
+      .then(() => true)
+      .catch(() => false);
+
+    if (!seen) {
+      const diag = await captureUiState(page, "comment-unverified");
+      return {
+        success: false,
+        error: "Comment was submitted but could not be confirmed on screen — do not re-send without checking (it may have landed).",
+        error_code: "UI_TIMEOUT",
+        data: diag as any,
+      };
+    }
+
+    recordAction(req.account_id, "tiktok", "comment");
+    return { success: true, data: { commented: true, target: req.video_url } };
+  } catch (e: any) {
+    const diag = await captureUiState(page, "comment-error").catch(() => ({}));
+    return { success: false, error: e.message || String(e), error_code: "UNKNOWN", data: diag as any };
+  } finally {
+    await close();
+  }
+}
+
 export interface TikTokPlaylistRequest extends TikTokOpRequest {
   /** What to do: create a playlist, or add/remove a public post. */
   action: "create" | "add" | "remove";
