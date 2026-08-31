@@ -1181,7 +1181,7 @@ export interface TikTokLikeRequest extends TikTokOpRequest {
   video_url: string;
 }
 
-export async function likeVideo(req: TikTokLikeRequest): Promise<TikTokOpResult<{ liked: boolean }>> {
+export async function likeVideo(req: TikTokLikeRequest): Promise<TikTokOpResult<{ liked: boolean; was_liked: boolean }>> {
   const blocked = gate(req.account_id, "like");
   if (blocked) return blocked;
 
@@ -1234,6 +1234,17 @@ export async function likeVideo(req: TikTokLikeRequest): Promise<TikTokOpResult<
     }
     console.error(`[tiktok] like button resolved via ${like.strategy}`);
 
+    // Read the current like state. The digg control is a toggle: like must only
+    // fire when the video is NOT yet liked, so a repeated like never flips it
+    // back to an unlike.
+    const pressed = await like.locator.getAttribute("aria-pressed").catch(() => null);
+    const wasLiked = pressed === true || String(pressed).toLowerCase() === "true";
+    console.error(`[tiktok] like button aria-pressed=${pressed} (wasLiked=${wasLiked})`);
+
+    if (wasLiked) {
+      return { success: true, data: { liked: false, was_liked: true } };
+    }
+
     const result = await submitAndAwaitTikTokApi(
       page,
       async () => { await like.locator.click({ timeout: 10000 }); },
@@ -1253,10 +1264,26 @@ export async function likeVideo(req: TikTokLikeRequest): Promise<TikTokOpResult<
       };
     }
 
+    // VERIFY the like actually applied by reading the button state back: the
+    // aria-pressed should flip to true. Trust observable state over the
+    // intercepted digg response alone.
+    const afterPressed = await like.locator.getAttribute("aria-pressed").catch(() => null);
+    const confirmedLiked = afterPressed === true || String(afterPressed).toLowerCase() === "true";
+    if (!confirmedLiked) {
+      const diag = await captureUiState(page, "like-verify");
+      return {
+        success: false,
+        error: "The like API call was seen but the button did not confirm the like. The state may or may not have changed — do not re-run blindly.",
+        error_code: "UI_TIMEOUT",
+        data: diag as any,
+      };
+    }
+
     recordAction(req.account_id, "tiktok", "like");
-    return { success: true, data: { liked: true } };
+    return { success: true, data: { liked: true, was_liked: false } };
   } catch (e: any) {
-    return { success: false, error: e.message || String(e), error_code: "UNKNOWN" };
+    const diag = await captureUiState(page, "like-error").catch(() => ({}));
+    return { success: false, error: e.message || String(e), error_code: "UNKNOWN", data: diag as any };
   } finally {
     await close();
   }
