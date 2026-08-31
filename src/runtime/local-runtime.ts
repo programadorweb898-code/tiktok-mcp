@@ -13,6 +13,7 @@ import {
   postVideo,
   searchByType,
   trendingFeed,
+  unlikeVideo,
   updateAvatar,
   updateProfile,
   type TikTokOpRequest,
@@ -313,6 +314,10 @@ export class LocalTikTokRuntime {
 
   like(input: { account_id: string; video_url: string }) {
     return this.start("like", input.account_id, input, (common) => likeVideo({ ...common, ...input }));
+  }
+
+  unlike(input: { account_id: string; video_url: string }) {
+    return this.start("like", input.account_id, input, (common) => unlikeVideo({ ...common, ...input }));
   }
 
   delete(input: { account_id: string; video_url: string }) {

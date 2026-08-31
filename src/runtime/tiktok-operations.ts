@@ -1143,6 +1143,109 @@ export async function likeVideo(req: TikTokLikeRequest): Promise<TikTokOpResult<
   }
 }
 
+export async function unlikeVideo(req: TikTokLikeRequest): Promise<TikTokOpResult<{ unliked: boolean; was_liked: boolean }>> {
+  const blocked = gate(req.account_id, "like");
+  if (blocked) return blocked;
+
+  if (!/^https:\/\/(www\.)?tiktok\.com\/@[A-Za-z0-9._]+\/video\/\d+/.test(req.video_url)) {
+    return { success: false, error: "video_url must be a TikTok /video/ permalink", error_code: "INVALID_INPUT" };
+  }
+
+  let session;
+  try {
+    session = await openAuthenticatedSession({
+      accountId: req.account_id,
+      proxySessionId: req.proxy_session_id,
+      cookies: req.cookies,
+      country: req.country,
+    });
+  } catch (e: any) {
+    return { success: false, error: `Failed to open session: ${e.message}`, error_code: "LAUNCH_FAILED" };
+  }
+
+  const { page, close } = session;
+  try {
+    await page.goto(req.video_url, { waitUntil: "domcontentloaded", timeout: 45000 });
+
+    const railReady = await waitForHydrated(page, HYDRATION_PROBES.videoActions, { timeoutMs: 30000 });
+    if (!railReady) {
+      const diag = await captureUiState(page, "unlike-rail-not-hydrated");
+      return {
+        success: false,
+        error: "The video page loaded but its engagement controls never rendered, so the like state could not be read.",
+        error_code: "NOT_READY",
+        data: diag as any,
+      };
+    }
+
+    if (await dismissBlockingModal(page, 6000)) console.error("[tiktok] dismissed a modal covering the like control");
+
+    const like = await resolveElement(page, [
+      { name: "data-e2e", build: (p) => p.locator('[data-e2e="like-icon"]') },
+      { name: "aria-label", build: (p) => p.locator('button[aria-label*="ike" i]') },
+      { name: "role-name", build: (p) => p.getByRole("button", { name: /like/i }) },
+    ], { perStrategyMs: 6000 });
+    if (!like) {
+      const diag = await captureUiState(page, "unlike-btn-missing");
+      return { success: false, error: "No like control on the video page after it rendered (selector may have rotated).", error_code: "UI_TIMEOUT", data: diag as any };
+    }
+    console.error(`[tiktok] like button resolved via ${like.strategy}`);
+
+    // Read the current like state off the button's aria-pressed attribute. The
+    // digg control is a toggle: unlike must only fire when the video is actually
+    // liked, and must never toggle it the wrong way.
+    const pressed = await like.locator.getAttribute("aria-pressed").catch(() => null);
+    const wasLiked = pressed === true || String(pressed).toLowerCase() === "true";
+    console.error(`[tiktok] like button aria-pressed=${pressed} (wasLiked=${wasLiked})`);
+
+    if (!wasLiked) {
+      return { success: true, data: { unliked: false, was_liked: false } };
+    }
+
+    const result = await submitAndAwaitTikTokApi(
+      page,
+      async () => { await like.locator.click({ timeout: 10000 }); },
+      /commit\/item\/digg|\/digg(\/|\?|$)/i,
+      15000,
+    );
+
+    if (!result) {
+      const diag = await captureUiState(page, "unlike-no-api");
+      return { success: false, error: "No unlike API call observed (digg endpoint not seen).", error_code: "UI_TIMEOUT", data: diag as any };
+    }
+    if (!result.ok) {
+      return {
+        success: false,
+        error: result.errorMessage || `HTTP ${result.status}`,
+        error_code: mapTikTokError(result.status, result.statusCode),
+      };
+    }
+
+    // VERIFY the like was actually removed by reading the button state back:
+    // the aria-pressed should drop to false. Trust observable state over the
+    // intercepted digg response alone.
+    const afterPressed = await like.locator.getAttribute("aria-pressed").catch(() => null);
+    const confirmedUnliked = afterPressed === false || String(afterPressed).toLowerCase() === "false";
+    if (!confirmedUnliked) {
+      const diag = await captureUiState(page, "unlike-verify");
+      return {
+        success: false,
+        error: "The unlike API call was seen but the like button did not confirm the removal. The state may or may not have changed — do not re-run blindly.",
+        error_code: "UI_TIMEOUT",
+        data: diag as any,
+      };
+    }
+
+    recordAction(req.account_id, "tiktok", "like");
+    return { success: true, data: { unliked: true, was_liked: true } };
+  } catch (e: any) {
+    const diag = await captureUiState(page, "unlike-error").catch(() => ({}));
+    return { success: false, error: e.message || String(e), error_code: "UNKNOWN", data: diag as any };
+  } finally {
+    await close();
+  }
+}
+
 export interface TikTokDeleteRequest extends TikTokOpRequest {
   video_url: string;
 }

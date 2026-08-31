@@ -2,7 +2,7 @@
 
 Este archivo es el documento principal de instrucciones para agentes que trabajen en este proyecto.
 
-- Responde siempre en espanol
+- Responde siempre en lenguaje espanol
 - NO debe contener detalles específicos de implementación que deberían vivir en skills.
 - NO debe inventar capacidades, APIs, endpoints, selectores ni comportamientos de TikTok.
 - Debe respetar y aprovechar la arquitectura existente del repositorio.

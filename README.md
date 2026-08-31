@@ -36,6 +36,7 @@ You can connect unlimited number of accounts. The agent will keep all TikTok ses
 | `tiktok_operation_status` | Poll an asynchronous browser job          |
 | `tiktok_follow`           | Follow a user                             |
 | `tiktok_like`             | Like a video                              |
+| `tiktok_unlike`           | Remove the like from a video              |
 | `tiktok_comment`          | Comment on another user's video           |
 | `tiktok_comments`         | List comments on the account's videos     |
 | `tiktok_delete`           | Delete a video                            |

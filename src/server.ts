@@ -179,6 +179,12 @@ export function createTikTokServer(options: TikTokServerOptions = {}): McpServer
     inputSchema: { account_id: ACCOUNT_ID, video_url: z.string().url() },
   }, (args) => runtime.like(args as any));
 
+  addTool(server, "tiktok_unlike", {
+    title: "Unlike a TikTok video",
+    description: "Remove the like from a video from a connected local profile. Reads the button's like state first, so it never toggles the wrong way; a video that is not liked is a no-op.",
+    inputSchema: { account_id: ACCOUNT_ID, video_url: z.string().url() },
+  }, (args) => runtime.unlike(args as any));
+
   addTool(server, "tiktok_comment", {
     title: "Comment on a TikTok video",
     description: "Post a comment on another user's video from a connected local profile. Verified by read-back of the published comment.",
