@@ -3536,3 +3536,121 @@ export async function trendingTopicsFeed(req: TikTokTrendingTopicsRequest): Prom
   }
 }
 
+export interface TikTokTrendingCreatorsRequest {
+  /** Optional local account to read within its authenticated session;
+   *  anonymous otherwise. */
+  account_id?: string;
+  country?: string;
+  /** Max creators to return. Defaults to 20. */
+  limit?: number;
+}
+
+/**
+ * Read the creators TikTok surfaces on its Discover page, with real,
+ * observed-only links to their `/@<handle>` pages together with the visible
+ * text (display name, handle, follower count). Like `tiktok_sounds` and
+ * `tiktok_trending_topics`, this never fabricates a ranking: it reports
+ * whatever links and text are actually on the page, keyed off the stable
+ * `/@<handle>` URL shape. The exact Discover DOM could not be captured in this
+ * development environment, so it uses resilient structural scraping and never
+ * guesses when the page fails to render (returns NOT_READY).
+ */
+export async function trendingCreatorsFeed(req: TikTokTrendingCreatorsRequest): Promise<TikTokOpResult<{ source: string; results: any[]; total_observed: number }>> {
+  const limit = req.limit && req.limit > 0 ? Math.min(req.limit, 50) : 20;
+
+  let session;
+  try {
+    session = await launchLocalContext({
+      accountId: req.account_id || "__trending_creators__",
+      cookies: [],
+      country: req.country,
+      loadMedia: false,
+    });
+  } catch (e: any) {
+    return { success: false, error: `Failed to open session: ${e.message}`, error_code: "LAUNCH_FAILED" };
+  }
+
+  const { page, close } = session;
+  try {
+    await page.goto("https://www.tiktok.com/discover", { waitUntil: "domcontentloaded", timeout: 45000 });
+
+    const rendered = await waitForHydrated(
+      page,
+      {
+        label: "trending-creators",
+        predicate: `(() => {
+          const links = document.querySelectorAll('a[href]');
+          let n = 0;
+          for (const a of links) {
+            if (/\\/@[^/?#]+/.test(a.getAttribute('href') || '')) n++;
+          }
+          return n > 0 ? 'rendered' : null;
+        })()`,
+      },
+      { timeoutMs: 30000 },
+    );
+
+    if (!rendered) {
+      const bodyText = (await page.evaluate(`document.body ? (document.body.textContent || '') : ''`).catch(() => "")) as string;
+      if (bodyText && /creator|@|followers?/i.test(bodyText)) {
+        return { success: true, data: { source: "discover", results: [], total_observed: 0 } };
+      }
+      const diag = await captureUiState(page, "trending-creators-not-rendered");
+      return {
+        success: false,
+        error: "The Discover page never rendered its creators surface, so no creators were read.",
+        error_code: "NOT_READY",
+        data: diag as any,
+      };
+    }
+
+    const scraped: any = await page.evaluate(
+      (lim) => {
+        const out: any[] = [];
+        const seen = new Set();
+        const links = Array.from(document.querySelectorAll("a[href]"));
+        for (const a of links) {
+          const href = a.getAttribute("href") || "";
+          const m = href.match(/\/@([^/?#]+)/);
+          if (!m) continue;
+          const handle = m[1];
+          const key = `@${handle}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const el: any = a;
+          const texts: string[] = [];
+          let node: any = el;
+          for (let i = 0; i < 6 && node; i++) {
+            const t = (node.innerText || "").replace(/\s+/g, " ").trim();
+            if (t) texts.unshift(t);
+            node = node.parentElement;
+          }
+          const snippet = texts.reduce((acc, x) => (acc.includes(x) ? acc : acc + " · " + x), "");
+          const followersMatch = snippet.match(/([\d.,]+\s*[KMB]?)\s*(followers|seguidores)/i);
+          out.push({
+            handle: `@${handle}`,
+            url: `https://www.tiktok.com/@${handle}`,
+            snippet: snippet.slice(0, 400),
+            followers_count: followersMatch ? followersMatch[1] : null,
+          });
+          if (out.length >= lim) break;
+        }
+        return out;
+      },
+      limit,
+    ).catch((e: any) => ({ error: String(e?.message || e) }));
+
+    if (!scraped || scraped.error) {
+      const diag = await captureUiState(page, "trending-creators-scrape-failed");
+      return { success: false, error: "Could not read the creators surface (unexpected structure).", error_code: "UI_TIMEOUT", data: diag as any };
+    }
+
+    return { success: true, data: { source: "discover", results: scraped as any[], total_observed: (scraped as any[]).length } };
+  } catch (e: any) {
+    const diag = await captureUiState(page, "trending-creators-error").catch(() => ({}));
+    return { success: false, error: e.message || String(e), error_code: "UNKNOWN", data: diag as any };
+  } finally {
+    await close();
+  }
+}
+

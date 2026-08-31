@@ -14,6 +14,7 @@ import {
   postVideo,
   searchByType,
   soundsFeed,
+  trendingCreatorsFeed,
   trendingFeed,
   trendingTopicsFeed,
   unfollowUser,
@@ -449,6 +450,11 @@ export class LocalTikTokRuntime {
   trendingTopics(input: { account_id?: string; country?: string; limit?: number }) {
     if (input.account_id) this.common(input.account_id);
     return trendingTopicsFeed(input);
+  }
+
+  trendingCreators(input: { account_id?: string; country?: string; limit?: number }) {
+    if (input.account_id) this.common(input.account_id);
+    return trendingCreatorsFeed(input);
   }
 
   scheduled(input: { account_id?: string; include_done?: boolean }) {
