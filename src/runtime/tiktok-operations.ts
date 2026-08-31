@@ -3298,5 +3298,123 @@ export async function trendingFeed(req: TikTokTrendingRequest): Promise<TikTokOp
   }
 }
 
+export interface TikTokSoundsRequest {
+  /** Optional local account to read within its authenticated session;
+   *  anonymous otherwise. */
+  account_id?: string;
+  country?: string;
+  /** Max sounds to return. Defaults to 20. */
+  limit?: number;
+}
 
+/**
+ * Read the sounds TikTok surfaces with real, observed-only links to their
+ * /music/<id> pages, together with the visible metadata (sound name, creator,
+ * "X videos" count) scraped from the surrounding DOM. Like `tiktok_search` and
+ * `tiktok_trending`, this never fabricates a ranking: it reports whatever links
+ * and text are actually on the page, keyed off the stable `/music/<id>` URL
+ * shape. The exact Discover DOM could not be captured in this development
+ * environment, so it uses resilient structural scraping and never guesses when
+ * the page fails to render (returns NOT_READY).
+ */
+export async function soundsFeed(req: TikTokSoundsRequest): Promise<TikTokOpResult<{ source: string; results: any[]; total_observed: number }>> {
+  const limit = req.limit && req.limit > 0 ? Math.min(req.limit, 50) : 20;
+
+  let session;
+  try {
+    session = await launchLocalContext({
+      accountId: req.account_id || "__sounds__",
+      cookies: [],
+      country: req.country,
+      loadMedia: false,
+    });
+  } catch (e: any) {
+    return { success: false, error: `Failed to open session: ${e.message}`, error_code: "LAUNCH_FAILED" };
+  }
+
+  const { page, close } = session;
+  try {
+    await page.goto("https://www.tiktok.com/discover", { waitUntil: "domcontentloaded", timeout: 45000 });
+
+    const rendered = await waitForHydrated(
+      page,
+      {
+        label: "sounds",
+        predicate: `(() => {
+          const links = document.querySelectorAll('a[href]');
+          let n = 0;
+          for (const a of links) {
+            if (/\\/music\\/\\d+/.test(a.getAttribute('href') || '')) n++;
+          }
+          return n > 0 ? 'rendered' : null;
+        })()`,
+      },
+      { timeoutMs: 30000 },
+    );
+
+    if (!rendered) {
+      // The Discover page may not show a music rail on every surface. If there
+      // is genuinely no /music/<id> link, report an empty result rather than a
+      // fake list — but only after the page actually rendered.
+      const bodyText = (await page.evaluate(`document.body ? (document.body.textContent || '') : ''`).catch(() => "")) as string;
+      if (bodyText && /music|sound|trending/i.test(bodyText)) {
+        return { success: true, data: { source: "discover", results: [], total_observed: 0 } };
+      }
+      const diag = await captureUiState(page, "sounds-not-rendered");
+      return {
+        success: false,
+        error: "The Discover page never rendered its music/sound surface, so no sounds were read.",
+        error_code: "NOT_READY",
+        data: diag as any,
+      };
+    }
+
+    const scraped: any = await page.evaluate(
+      (lim) => {
+        const out: any[] = [];
+        const seen = new Set();
+        const links = Array.from(document.querySelectorAll("a[href]"));
+        for (const a of links) {
+          const href = a.getAttribute("href") || "";
+          const m = href.match(/\/music\/(\d+)/);
+          if (!m) continue;
+          const key = `music/${m[1]}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const el: any = a;
+          const texts: string[] = [];
+          let node: any = el;
+          for (let i = 0; i < 6 && node; i++) {
+            const t = (node.innerText || "").replace(/\s+/g, " ").trim();
+            if (t) texts.unshift(t);
+            node = node.parentElement;
+          }
+          const snippet = texts.reduce((acc, x) => (acc.includes(x) ? acc : acc + " · " + x), "");
+          const videosMatch = snippet.match(/([\d.,]+\s*[KMB]?)\s*videos/i);
+          out.push({
+            sound_id: m[1],
+            url: `https://www.tiktok.com/music/${m[1]}`,
+            snippet: snippet.slice(0, 400),
+            videos_count: videosMatch ? videosMatch[1] : null,
+          });
+          if (out.length >= lim) break;
+        }
+        return out;
+      },
+      limit,
+    ).catch((e: any) => ({ error: String(e?.message || e) }));
+
+    if (!scraped || scraped.error) {
+      const diag = await captureUiState(page, "sounds-scrape-failed");
+      return { success: false, error: "Could not read the sounds surface (unexpected structure).", error_code: "UI_TIMEOUT", data: diag as any };
+    }
+
+    return { success: true, data: { source: "discover", results: scraped as any[], total_observed: (scraped as any[]).length } };
+  } catch (e: any) {
+    const diag = await captureUiState(page, "sounds-error").catch(() => ({}));
+    return { success: false, error: e.message || String(e), error_code: "UNKNOWN", data: diag as any };
+  } finally {
+    await close();
+  }
+}
 

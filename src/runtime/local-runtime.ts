@@ -13,6 +13,7 @@ import {
   playlistManage,
   postVideo,
   searchByType,
+  soundsFeed,
   trendingFeed,
   unfollowUser,
   unlikeVideo,
@@ -437,6 +438,11 @@ export class LocalTikTokRuntime {
   trending(input: { account_id?: string; country?: string; limit?: number }) {
     if (input.account_id) this.common(input.account_id);
     return trendingFeed(input);
+  }
+
+  sounds(input: { account_id?: string; country?: string; limit?: number }) {
+    if (input.account_id) this.common(input.account_id);
+    return soundsFeed(input);
   }
 
   scheduled(input: { account_id?: string; include_done?: boolean }) {

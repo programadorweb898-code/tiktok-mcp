@@ -273,6 +273,16 @@ export function createTikTokServer(options: TikTokServerOptions = {}): McpServer
     },
   }, (args) => runtime.trending(args as any));
 
+  addTool(server, "tiktok_sounds", {
+    title: "Read trending sounds",
+    description: "Read the sounds TikTok surfaces on its Discover page with real links to /music/<id> and visible metadata (sound name, creator, videos count). Read-only, observed-only: never fabricates a ranking. account_id optional (anonymous otherwise).",
+    inputSchema: {
+      account_id: ACCOUNT_ID.optional().describe("Optional local account to read within its session; anonymous otherwise"),
+      country: z.string().optional(),
+      limit: z.number().int().min(1).max(50).optional().describe("Defaults to 20"),
+    },
+  }, (args) => runtime.sounds(args as any));
+
   addTool(server, "tiktok_delete", {
     title: "Delete a TikTok video",
     description: "Delete one of the connected account's videos.",

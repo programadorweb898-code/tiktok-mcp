@@ -50,7 +50,7 @@ El sistema combina: MCP (stdio), Playwright con perfiles de navegador persistent
 ```
 Agente MCP (Claude Code, Codex, Hermes, …)
         ↓  stdio (JSON-RPC)
-src/server.ts            — definición y validación de las 30 tools MCP
+src/server.ts            — definición y validación de las 31 tools MCP
         ↓
 LocalTikTokRuntime       — src/runtime/local-runtime.ts
         ↓                (operaciones asíncronas + registro de jobs)
@@ -69,7 +69,7 @@ TikTok (web + TikTok Studio)
 | Archivo | Responsabilidad |
 |---|---|
 | `src/index.ts` | Entrypoint binario (`tiktok-mcp`). Flags: `--data-dir`, `--browser-path`, `--headless`. Transporte stdio. |
-| `src/server.ts` | Registro de las 30 tools con esquemas zod, wrapper `addTool` con captura de errores y devolución estructurada (`structuredContent` + texto JSON). |
+| `src/server.ts` | Registro de las 31 tools con esquemas zod, wrapper `addTool` con captura de errores y devolución estructurada (`structuredContent` + texto JSON). |
 | `src/runtime/local-runtime.ts` | Orquestador. Crea operaciones asíncronas (`pending → running → done/failed/cancelled`), gestiona el flujo de conexión QR, delega en las operaciones. |
 | `src/runtime/tiktok-operations.ts` | Implementación real de cada operación contra TikTok: subida de video, follow, like, delete, perfil, avatar, scraping de analíticas. Incluye helpers de diagnóstico, modales, privacidad, scheduling nativo e interceptor de respuestas API. |
 | `src/runtime/media-mix.ts` | Fusión local de media con `ffmpeg-static` (binario incluido): reemplaza o superpone una pista de audio sobre un video y produce un MP4 listo para `tiktok_post`. |
@@ -98,7 +98,7 @@ Solo puede haber **una sesión de navegador abierta por cuenta a la vez**: `lock
 
 ## 4. Capacidades actuales (tools MCP)
 
-Verificado contra `src/server.ts`. El servidor expone exactamente 30 tools (el test lo afirma).
+Verificado contra `src/server.ts`. El servidor expone exactamente 31 tools (el test lo afirma).
 
 | Tool | Propósito | Parámetros principales | Implementación | Browser/API | Estado | Limitaciones conocidas |
 |---|---|---|---|---|---|---|
@@ -126,6 +126,7 @@ Verificado contra `src/server.ts`. El servidor expone exactamente 30 tools (el t
 | `tiktok_pin_video` | Fijar/destrabar video en el perfil | `account_id`, `video_url`, `action` (`pin`/`unpin`) | Abre el video propio, usa su menú de acciones ("Pin to profile"/"Unpin"), y verifica navegando de vuelta al perfil por el badge "Pinned" del tile (read-back observable) | Browser | IMPLEMENTADO (v1; requiere validación manual) | Límite de TikTok: hasta 3 videos fijados. El DOM del menú de acciones no se inspeccionó en desarrollo → selectores resilientes (role/aria → texto) + verificación por perfil; nunca reporta éxito sin confirmar el estado (o ya-estaba-en-estado deseado) |
 | `tiktok_playlist_manage` | Crear / añadir / quitar post de playlist | `account_id`, `action` (`create`/`add`/`remove`), `name`, `video_url?` (add/remove) | `create`: perfil propio → "Manage playlists" → "Create playlist" → nombre → confirmar, verificado por read-back del nombre. `add`/`remove`: menú del video → "Add to playlist"/"Remove from playlist" → elegir playlist, verificado por read-back | Browser | IMPLEMENTADO (v1; requiere validación manual) | Solo disponible con 10k+ seguidores (elegibilidad de TikTok); la cuenta actual no califica → DOM no inspeccionado, selectores resilientes + read-back. Un post público solo puede estar en UNA playlist. Si no aparece "Create playlist", devuelve `NOT_READY` (no fabrica disponibilidad) |
 | `tiktok_search` | Buscar videos/usuarios/hashtags | `query`, `type?` (`video`/`user`/`hashtag`), `account_id?`, `limit?` | Navega a `/search/<type>?q=...` (anónimo o con la sesión de la cuenta), espera links de resultado reales, extrae links + snippet visible; scrape defensivo, nunca fabrica. Lista vacía = observado sin resultados | Browser (anónimo o auth) | IMPLEMENTADO (v1; requiere validación manual) | Búsqueda pública; sin canonicalizar el orden ni puntuar. El DOM de resultados no se inspeccionó en desarrollo → se lee por links reales + texto visible; si no renderiza, `NOT_READY` (o lista vacía si el estado vacío es observable) |
+| `tiktok_sounds` | Leer sounds en Discover | `account_id?`, `country?`, `limit?` | Navega a `/discover`, espera links `/music/<id>` reales, extrae sound_id + URL + snippet visible + count de videos (best-effort); scrape defensivo, nunca fabrica un ranking | Browser (anónimo o auth) | IMPLEMENTADO (v1; requiere validación manual) | Solo lo observado; el DOM de Discover no se inspeccionó en desarrollo → se lee por links reales a `/music/<id>`; si no renderiza, `NOT_READY` (o lista vacía si la página mostró texto de music/sound) |
 | `tiktok_series` | Leer historial local / crecimiento | `account_id`, `video_id?`, `hours?` | Cálculo puro sobre `state.json` | — (local) | IMPLEMENTADO | Solo tiene datos de muestras previas de `tiktok_analytics` |
 | `tiktok_hooks` | Analizar aperturas de captions | `account_id?`, `tag/niche?`, `caption?`, `maturity_days?`, `recency_days?` | Heurística local (10 patrones regex) sobre métricas propias | — (local) | IMPLEMENTADO | Análisis estadístico local, NO datos de TikTok; requiere ≥3 posts por patrón para marcar confianza |
 | `tiktok_niches` | Listar nichos sugeridos | — | Lista estática | — | IMPLEMENTADO | Taxonomía cerrada de 24 entradas |
@@ -191,8 +192,8 @@ Estados: `IMPLEMENTED` · `PARTIAL` · `PLANNED` · `RESEARCH` · `BLOCKED` · `
 | búsqueda de usuarios | PARTIAL (v1) | `tiktok_search` (`type: user`) — links reales + snippet |
 | búsqueda de hashtags | PARTIAL (v1) | `tiktok_search` (`type: hashtag`) — links reales + snippet |
 | contenido en tendencia | RESEARCH | — |
-| explore / FYP | RESEARCH | — |
-| sounds | RESEARCH | — |
+| explore / FYP | PARTIAL (v1) | `tiktok_trending` lee el feed For You (personalizado, no ranking global) |
+| sounds | PARTIAL (v1) | `tiktok_sounds` lee sounds desde Discover (links reales a `/music/<id>` + snippet + count de videos best-effort); validación manual pendiente |
 | creadores | RESEARCH | — |
 
 Fase 3 del roadmap.
@@ -331,7 +332,7 @@ Separación estricta entre datos observados de TikTok y cálculo local:
 
 Actual (`npm test` = build + `node --test dist/tests/local.test.js`, framework `node:test`):
 
-- Unitarios/integración local: persistencia de cuentas y muestras de analíticas (recordSample dedup, series, latest), contrato de las 30 tools vía `InMemoryTransport` (nombres, ausencia de campos de pago, llamada a `tiktok_niches`), arranque real del binario empaquetado por stdio, contrato HTTP del cliente QR relay (con fetch inyectado). La fusión de media (`tiktok_mix_media`), el quiz visual (`tiktok_make_quiz`) y el duet/stitch (`tiktok_make_duet`) se validan con una ejecución manual real de `ffmpeg` sobre archivos de prueba; no hay test automatizado del binario. `tiktok_monetization_status` se implementó sin poder inspeccionar el DOM real (requiere cuenta apta autenticada): su validación final es manual. Igual para `tiktok_comment_reply`, que depende del DOM de Comment Management (requiere una cuenta con comentarios): validación final manual. `tiktok_pin_video`, que depende del menú de acciones del video, también requiere validación manual contra una cuenta real. `tiktok_playlist_manage` comparte la misma situación: solo está disponible para cuentas con 10k+ seguidores, así que su validación final es manual contra una cuenta apta. `tiktok_search` también se implementó sin inspeccionar el DOM de resultados en desarrollo (búsqueda pública): se lee por links reales + texto visible y su validación final es manual. `tiktok_comment` comparte la situación del watch page (DOM de comentarios no inspeccionado en desarrollo): selectores resilientes + read-back, validación final manual contra una cuenta real. `tiktok_like` y `tiktok_unlike`, al depender ambos del atributo `aria-pressed` del botón de like en el watch page (misma superficie no inspeccionada en desarrollo desde DEC-017), requieren validación manual: se debe confirmar que el like aparece realmente (y que un like repetido no hace unlike). `tiktok_unfollow`, al depender del estado textual del botón de follow en el perfil público y del posible diálogo de confirmación (superficie no inspeccionada en desarrollo), también requiere validación manual contra una cuenta con seguidores. `tiktok_delete_comment`, al depender del menú "…" de cada fila de comentario en Comment Management (superficie no inspeccionada en desarrollo), también requiere validación manual. `tiktok_comments`, al depender del DOM de Comment Management (misma superficie que `tiktok_comment_reply`), también requiere validación manual contra una cuenta real con comentarios.
+- Unitarios/integración local: persistencia de cuentas y muestras de analíticas (recordSample dedup, series, latest), contrato de las 31 tools vía `InMemoryTransport` (nombres, ausencia de campos de pago, llamada a `tiktok_niches`), arranque real del binario empaquetado por stdio, contrato HTTP del cliente QR relay (con fetch inyectado). La fusión de media (`tiktok_mix_media`), el quiz visual (`tiktok_make_quiz`) y el duet/stitch (`tiktok_make_duet`) se validan con una ejecución manual real de `ffmpeg` sobre archivos de prueba; no hay test automatizado del binario. `tiktok_monetization_status` se implementó sin poder inspeccionar el DOM real (requiere cuenta apta autenticada): su validación final es manual. Igual para `tiktok_comment_reply`, que depende del DOM de Comment Management (requiere una cuenta con comentarios): validación final manual. `tiktok_pin_video`, que depende del menú de acciones del video, también requiere validación manual contra una cuenta real. `tiktok_playlist_manage` comparte la misma situación: solo está disponible para cuentas con 10k+ seguidores, así que su validación final es manual contra una cuenta apta. `tiktok_search` también se implementó sin inspeccionar el DOM de resultados en desarrollo (búsqueda pública): se lee por links reales + texto visible y su validación final es manual. `tiktok_comment` comparte la situación del watch page (DOM de comentarios no inspeccionado en desarrollo): selectores resilientes + read-back, validación final manual contra una cuenta real. `tiktok_like` y `tiktok_unlike`, al depender ambos del atributo `aria-pressed` del botón de like en el watch page (misma superficie no inspeccionada en desarrollo desde DEC-017), requieren validación manual: se debe confirmar que el like aparece realmente (y que un like repetido no hace unlike). `tiktok_unfollow`, al depender del estado textual del botón de follow en el perfil público y del posible diálogo de confirmación (superficie no inspeccionada en desarrollo), también requiere validación manual contra una cuenta con seguidores. `tiktok_delete_comment`, al depender del menú "…" de cada fila de comentario en Comment Management (superficie no inspeccionada en desarrollo), también requiere validación manual. `tiktok_comments`, al depender del DOM de Comment Management (misma superficie que `tiktok_comment_reply`), también requiere validación manual contra una cuenta real con comentarios. `tiktok_sounds`, al depender del DOM de Discover y de la presencia de links a `/music/<id>` (superficie no inspeccionada en desarrollo), también requiere validación manual.
 - **No existen tests de browser contra TikTok real automatizados.**
 
 Estrategia definida:
@@ -385,7 +386,7 @@ Estrategia definida:
 |---|---|---|
 | 1 | Estabilizar el MCP existente: comprender la arquitectura, pruebas, endurecer selectores y errores | En curso |
 | 2 | Completar engagement: unlike/unfollow, comentarios (leer, escribir, responder, borrar) | En curso (escribir comentarios `tiktok_comment`; leer comentarios `tiktok_comments`; response en Studio `tiktok_comment_reply`; borrar comentarios `tiktok_delete_comment`; unlike `tiktok_unlike`; unfollow `tiktok_unfollow`) |
-| 3 | Discovery y trends: búsquedas (videos/usuarios/hashtags), tendencias, sounds | En curso (búsqueda implementada `tiktok_search`; tendencias/sounds pendientes) |
+| 3 | Discovery y trends: búsquedas (videos/usuarios/hashtags), tendencias, sounds | En curso (búsqueda implementada `tiktok_search`; sounds `tiktok_sounds`; tendencias/discover pendiente) |
 | 4 | Analytics avanzados: analíticas de perfil, métricas profundas de Studio, histórico más rico | Planificado |
 | 5 | LIVE: descubrimiento, información e interacción | Planificado |
 | 6 | Cobertura adicional: photo posts, drafts, edición de posts publicados, APIs oficiales donde apliquen (ya implementados: fusión de media `tiktok_mix_media`, quiz visual `tiktok_make_quiz`, duet/stitch local `tiktok_make_duet`, lectura de monetización `tiktok_monetization_status`, respuesta de comentarios `tiktok_comment_reply`, fijar videos `tiktok_pin_video` y playlists `tiktok_playlist_manage`) | Planificado |
@@ -588,6 +589,18 @@ Decisión: igualar `likeVideo` con la lectura de estado que ya implementó `unli
 Motivo: resolver la limitación de engagement más importante documentada — "repetir un like ejecuta un unlike". Con la lectura de estado, `like` y `unlike` son ahora recíprocos e idempotentes (repetir cualquiera de los dos es un no-op), eliminando la ambigüedad del toggle.
 Alternativas consideradas: dejar `like` como toggle puro y confiar en la intercepción de API (rechazado: la API `digg` no distingue like de unlike, y el comportamiento observado del usuario es el que importa); leer el estado vía clase CSS (rechazado: más frágil que `aria-pressed`, ya validado en DEC-014).
 Consecuencias: no cambia el conteo de tools ni rompe el contrato de parámetros; cambia el shape de retorno de `likeVideo` de `{ liked: boolean }` a `{ liked: boolean; was_liked: boolean }` (compatible: ambos estaban ya en uso en `unlikeVideo`). `like` y `unlike` comparten la misma dependencia de `aria-pressed` del watch page, sin inspeccionar en desarrollo → validación manual pendiente.
+
+---
+
+## DEC-018 — Sounds trending desde Discover como operación READ síncrona
+
+Fecha: 2026-08-31
+
+Estado: Aceptada (implementada v1, validación manual pendiente)
+Decisión: implementar `tiktok_sounds` para leer los sounds que TikTok muestra en su página Discover (`/discover`), esperando que aparezcan links reales a `/music/<id>`, y extrayendo para cada uno su `sound_id`, URL, snippet visible y (best-effort) el count de videos. Reutiliza exactamente el patrón defensivo de `trendingFeed`/`searchByType` (scrape por links reales + recorrido de `parentElement` para el snippet); nunca fabrica un ranking. Si la página renderiza pero no hay links `/music/<id>`, devuelve lista vacía solo cuando el texto de la página contiene music/sound; de lo contrario `NOT_READY`.
+Motivo: los sounds son una pieza central de la Fase 3 (Discovery/trends) que el roadmap marcaba pendiente; leer los sonidos en tendencia con sus enlaces es la base para luego reutilizar ese audio (vía `tiktok_make_duet`/`tiktok_mix_media`) o crear contenido alrededor de un sound de moda.
+Alternativas consideradas: navegar a un listado específico de sounds trending (rechazado: no se conoce una URL web estable pública de ese listado sin inventar); interceptar un endpoint interno de sounds (rechazado: no se observa sin inspeccionar una sesión real).
+Consecuencias: la tool es síncrona de lectura (no pasa por un job ni está sujeta al cap protector). Depende de que Discover exponga links a `/music/<id>` — superficie no inspeccionada en desarrollo, por lo que su validación final es manual contra TikTok real. Conteo pasa de 30 a 31 tools.
 
 ---
 
