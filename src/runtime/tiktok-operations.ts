@@ -266,6 +266,32 @@ async function dismissBlockingModal(page: any, windowMs: number = 12000): Promis
 }
 
 /**
+ * TikTok Studio (Creator Center) is a heavy SPA that boots lazily: on a cold
+ * browser start the app shell takes noticeably longer than the lighter public
+ * pages (watch/profile) to become interactive. A single `goto` straight to a
+ * deep Studio route then times out on hydration. Used by every Studio-backed
+ * operation so cold starts share one (generous) budget instead of guessing per
+ * call site.
+ */
+const STUDIO_HYDRATION_TIMEOUT_MS = 60_000;
+
+/**
+ * Give the Creator Center SPA a head start before an operation waits on a deep
+ * Studio route. Navigating to the lightweight Studio home first pulls the app
+ * bundles and lets the session "boot" so the subsequent targeted wait has a
+ * warm, rendered shell instead of fighting first-load hydration. Best-effort:
+ * it never blocks the operation, just improves the odds on the first call.
+ */
+async function warmStudioSession(page: any): Promise<void> {
+  try {
+    await page.goto("https://www.tiktok.com/tiktokstudio", { waitUntil: "domcontentloaded", timeout: 20_000 }).catch(() => {});
+    await page.waitForTimeout(2_000);
+  } catch {
+    /* best-effort warm-up; the real wait below handles failures */
+  }
+}
+
+/**
  * Set the "Who can see this post" audience. It's a
  * `button[role="combobox"][aria-haspopup="dialog"]` showing the current value
  * ("Everyone" by default); we open it and pick the option, then VERIFY the
@@ -539,6 +565,7 @@ export async function findPostedVideo(
   caption: string,
 ): Promise<{ video_id?: string; video_url?: string; matched: "caption" | "newest" | "none" }> {
   if (!/tiktokstudio\/(content|posts)/i.test(String(page.url()))) {
+    await warmStudioSession(page);
     await page.goto("https://www.tiktok.com/tiktokstudio/content", { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
   }
   await page.locator('a[href*="/video/"]').first().waitFor({ timeout: 15000 }).catch(() => {});
@@ -1144,6 +1171,7 @@ export async function deleteVideo(req: TikTokDeleteRequest): Promise<TikTokOpRes
   try {
     // Deletion lives in the TikTok Studio post manager — NOT the public
     // /video/ watch page, whose "..." menu only has player options + Report.
+    await warmStudioSession(page);
     await page.goto("https://www.tiktok.com/tiktokstudio/content", { waitUntil: "domcontentloaded", timeout: 45000 });
 
     // This wait used to accept the search box OR a post link — and the search
@@ -1153,7 +1181,7 @@ export async function deleteVideo(req: TikTokDeleteRequest): Promise<TikTokOpRes
     // manager (analytics listed it a minute earlier) failed with "already
     // deleted", and its diagnostics contained only the Studio nav buttons and
     // zero rows. Gate on rows actually being present.
-    const listState = await waitForHydrated(page, HYDRATION_PROBES.studioContent, { timeoutMs: 30000 });
+    const listState = await waitForHydrated(page, HYDRATION_PROBES.studioContent, { timeoutMs: STUDIO_HYDRATION_TIMEOUT_MS });
     if (!listState) {
       const diag = await captureUiState(page, "delete-list-not-hydrated");
       return {
@@ -1568,6 +1596,7 @@ export async function analyzePosts(req: TikTokAnalyticsRequest): Promise<TikTokO
 
   const { page, close } = session;
   try {
+    await warmStudioSession(page);
     await page.goto("https://www.tiktok.com/tiktokstudio/content", { waitUntil: "domcontentloaded", timeout: 45000 });
 
     // The old wait here swallowed its own timeout with `.catch(() => {})` and
@@ -1577,7 +1606,7 @@ export async function analyzePosts(req: TikTokAnalyticsRequest): Promise<TikTokO
     // video with 96 views; the same account returned 2 posts minutes later.
     // That is silent data corruption — an agent polling on a schedule records
     // fabricated "engagement collapsed" history and pays for every sample.
-    const listState = await waitForHydrated(page, HYDRATION_PROBES.studioContent, { timeoutMs: 30000 });
+    const listState = await waitForHydrated(page, HYDRATION_PROBES.studioContent, { timeoutMs: STUDIO_HYDRATION_TIMEOUT_MS });
     if (!listState) {
       const diag = await captureUiState(page, "analytics-list-not-hydrated");
       return {
@@ -1714,6 +1743,7 @@ export async function monetizationStatus(
 
   const { page, close } = session;
   try {
+    await warmStudioSession(page);
     await page.goto("https://www.tiktok.com/tiktokstudio/monetization", { waitUntil: "domcontentloaded", timeout: 45000 });
 
     // Wait for real, monetization-related text to render (not the empty SPA
@@ -1729,7 +1759,7 @@ export async function monetizationStatus(
           return /monetization|creator rewards|reward|eligible|payout|earnings|rpm/.test(t) ? (t.length > 200 ? 'rendered' : 'shell') : null;
         })()`,
       },
-      { timeoutMs: 30000 },
+      { timeoutMs: STUDIO_HYDRATION_TIMEOUT_MS },
     );
     if (!rendered || rendered === "shell") {
       const diag = await captureUiState(page, "monetization-not-hydrated");
@@ -2011,6 +2041,7 @@ export async function commentReply(req: TikTokCommentRequest): Promise<TikTokOpR
 
   const { page, close } = session;
   try {
+    await warmStudioSession(page);
     await page.goto("https://www.tiktok.com/tiktokstudio/comment-management", { waitUntil: "domcontentloaded", timeout: 45000 });
 
     // Wait for a comment-oriented surface to render (not the empty SPA shell).
@@ -2025,7 +2056,7 @@ export async function commentReply(req: TikTokCommentRequest): Promise<TikTokOpR
           return (hasWord + hasAnyNode) >= 2 ? 'rendered' : null;
         })()`,
       },
-      { timeoutMs: 30000 },
+      { timeoutMs: STUDIO_HYDRATION_TIMEOUT_MS },
     );
     if (!rendered) {
       const diag = await captureUiState(page, "comment-management-not-hydrated");
@@ -2276,6 +2307,152 @@ export async function commentOnVideo(req: TikTokCommentOnVideoRequest): Promise<
     return { success: true, data: { commented: true, target: req.video_url } };
   } catch (e: any) {
     const diag = await captureUiState(page, "comment-error").catch(() => ({}));
+    return { success: false, error: e.message || String(e), error_code: "UNKNOWN", data: diag as any };
+  } finally {
+    await close();
+  }
+}
+
+export interface TikTokListCommentsRequest extends TikTokOpRequest {
+  /** Optional video id to narrow the read to comments on that single video. */
+  video_id?: string;
+  /** Cap on the number of comments read (defensive; no meaningful default on a lazy list). */
+  limit?: number;
+}
+
+/**
+ * Read the comments posted on the account's videos from TikTok Studio's web
+ * Comment Management (`/tiktokstudio/comment-management`). A READ, so it is not
+ * subject to the protective action cap.
+ *
+ * The Comment Management page groups comments per video. We scroll to load the
+ * lazy list and pull, for each comment we can observe: the commenter's handle,
+ * the comment text, and any numeric engagement (reply/like counts) plus a
+ * best-effort video id when the comment row carries a link back to its post.
+ *
+ * LIMITATION: like monetization/comment-reply, the exact comment-management DOM
+ * could not be captured in this development environment (it needs a session with
+ * comments). Uses resilient structural scraping (leaf text nodes, links to
+ * /video/<id>) and never fabricates; a page that fails to render reports
+ * NOT_READY. Must be validated manually against a real account with comments.
+ */
+export async function listComments(req: TikTokListCommentsRequest): Promise<TikTokOpResult<{ comments: any[]; count: number; requested_at: string; narrowed_by_video_id?: boolean }>> {
+  let session;
+  try {
+    session = await openAuthenticatedSession({
+      accountId: req.account_id,
+      proxySessionId: req.proxy_session_id,
+      cookies: req.cookies,
+      country: req.country,
+    });
+  } catch (e: any) {
+    return { success: false, error: `Failed to open session: ${e.message}`, error_code: "LAUNCH_FAILED" };
+  }
+
+  const { page, close } = session;
+  try {
+    await warmStudioSession(page);
+    await page.goto("https://www.tiktok.com/tiktokstudio/comment-management", { waitUntil: "domcontentloaded", timeout: 45000 });
+
+    // Same readiness rule as commentReply: gate on a comment-oriented surface
+    // actually rendering, so a lazy shell is never read as "no comments".
+    const rendered = await waitForHydrated(
+      page,
+      {
+        label: "comment-management-list",
+        predicate: `(() => {
+          const t = (document.body.textContent || '').toLowerCase();
+          return (/comments|comment/.test(t) ? 1 : 0) + (document.querySelectorAll('a[href*="/video/"], button').length > 0 ? 1 : 0) >= 2 ? 'rendered' : null;
+        })()`,
+      },
+      { timeoutMs: STUDIO_HYDRATION_TIMEOUT_MS },
+    );
+    if (!rendered) {
+      const diag = await captureUiState(page, "comments-list-not-hydrated");
+      return {
+        success: false,
+        error: "The comment-management page never finished rendering, so no comments were read. Reporting an empty list would be wrong.",
+        error_code: "NOT_READY",
+        data: diag as any,
+      };
+    }
+    await page.waitForTimeout(1500);
+    await dismissBlockingModal(page);
+
+    // Load lazy comments by scrolling, reusing the settle-until-stable rule so
+    // a slow fetch isn't mistaken for the end of the list.
+    const limit = req.limit ?? 200;
+    let scrolls = 0;
+    let lastCount = -1;
+    let stable = 0;
+    while (scrolls < 40 && stable < 2) {
+      const count = Number(
+        await page.evaluate(`document.querySelectorAll('a[href*="/video/"], [data-e2e*="comment" i]').length`).catch(() => 0),
+      );
+      if (count === lastCount) stable++;
+      else { stable = 0; lastCount = count; }
+      if (stable >= 2 || lastCount >= limit) break;
+      await page.evaluate(`window.scrollTo(0, document.body.scrollHeight)`).catch(() => {});
+      await page.waitForTimeout(1200);
+      scrolls++;
+    }
+
+    const scraped: any = await page.evaluate(`(() => {
+      const parseNum = (t) => {
+        if (t == null) return null;
+        const m = String(t).trim().replace(/,/g, '').match(/^([\\d.]+)\\s*([KMB])?$/i);
+        if (!m) return null;
+        let n = parseFloat(m[1]); const u = (m[2] || '').toUpperCase();
+        if (u === 'K') n *= 1e3; else if (u === 'M') n *= 1e6; else if (u === 'B') n *= 1e9;
+        return Math.round(n);
+      };
+      // Best-effort: find leaf text nodes that look like comments (not nav/chrome)
+      // and, separately, any video links carried by the rows so we can join back.
+      const comments = [];
+      const videoLinks = [...document.querySelectorAll('a[href*="/video/"]')];
+      const skip = new Set(['comment', 'comments', 'reply', 'respond', 'like', 'view all', 'view more']);
+      const texts = new Set();
+      for (const el of document.querySelectorAll('*')) {
+        if (el.children.length !== 0) continue;
+        const t = (el.textContent || '').trim();
+        if (t.length < 2 || t.length > 500 || texts.has(t)) continue;
+        if (skip.has(t.toLowerCase())) continue;
+        if (/^[\\d.,]+\\s*[KMB]?$/i.test(t)) continue; // bare metric
+        texts.add(t);
+      }
+      let idx = 0;
+      for (const t of texts) {
+        if (idx++ >= 200) break;
+        comments.push({ text: t });
+      }
+      return { comments, video_links: videoLinks.map((a) => a.getAttribute('href') || '').slice(0, 50) };
+    })()`).catch((e: any) => ({ error: String(e?.message || e) }));
+
+    if (!scraped || scraped.error) {
+      const diag = await captureUiState(page, "comments-scrape-failed");
+      return { success: false, error: "Could not scrape the comment management page.", error_code: "UI_TIMEOUT", data: diag as any };
+    }
+
+    const requested_at = new Date().toISOString();
+    const comments = (scraped.comments as any[] || []).slice(0, limit).map((c, i) => ({
+      ...c,
+      video_id_from_link: (scraped.video_links || [])[Math.min(i, (scraped.video_links || []).length - 1)] || null,
+    }));
+
+    // Narrow to a single video if the caller asked (comment rows that carry a
+    // link back to the requested video id).
+    if (req.video_id) {
+      const ids = new Set((scraped.video_links || []).filter((l: string) => /\/video\//.test(l)).map((l: string) => (/\/video\/(\\d+)/.exec(l) || [])[1]));
+      const kept = comments.filter((c) => c.video_id_from_link && ids.has(String(req.video_id)));
+      return {
+        success: true,
+        data: { comments: kept, count: kept.length, requested_at, narrowed_by_video_id: true },
+      };
+    }
+
+    return { success: true, data: { comments, count: comments.length, requested_at } };
+  } catch (e: any) {
+    const diag = await captureUiState(page, "comments-error").catch(() => ({}));
     return { success: false, error: e.message || String(e), error_code: "UNKNOWN", data: diag as any };
   } finally {
     await close();

@@ -189,6 +189,16 @@ export function createTikTokServer(options: TikTokServerOptions = {}): McpServer
     },
   }, (args) => runtime.comment(args as any));
 
+  addTool(server, "tiktok_comments", {
+    title: "List comments on the account's videos",
+    description: "Read the comments posted on the account's videos from TikTok Studio's Comment Management. Read-only; optional video_id and limit filters.",
+    inputSchema: {
+      account_id: ACCOUNT_ID,
+      video_id: z.string().optional().describe("Narrow the read to comments on this single video id"),
+      limit: z.number().int().min(1).max(500).optional().describe("Cap on the number of comments read"),
+    },
+  }, (args) => runtime.comments(args as any));
+
   addTool(server, "tiktok_comment_reply", {
     title: "Reply to a comment",
     description: "Reply to a comment in TikTok Studio's web Comment Management. Locates the comment by its text and posts a text reply, verified by read-back of the posted reply.",

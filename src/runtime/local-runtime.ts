@@ -6,6 +6,7 @@ import {
   deleteVideo,
   followUser,
   likeVideo,
+  listComments,
   monetizationStatus,
   pinVideo,
   playlistManage,
@@ -353,6 +354,15 @@ export class LocalTikTokRuntime {
    */
   comment(input: { account_id: string; video_url: string; comment: string }) {
     return this.start("comment", input.account_id, input, (common) => commentOnVideo({ ...common, ...input }));
+  }
+
+  /**
+   * Read the comments on the account's videos from TikTok Studio's Comment
+   * Management. A read-only browser query; optional video_id/limit filter.
+   */
+  comments(input: { account_id: string; video_id?: string; limit?: number }) {
+    this.common(input.account_id);
+    return listComments({ account_id: input.account_id, country: getAccount(input.account_id)?.country, cookies: [], video_id: input.video_id, limit: input.limit });
   }
 
   /**
