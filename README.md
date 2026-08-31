@@ -34,6 +34,7 @@ You can connect unlimited number of accounts. The agent will keep all TikTok ses
 | `tiktok_search`             | Search TikTok (videos, users, hashtags) |
 | `tiktok_trending`           | Read the For You feed (trending for you) |
 | `tiktok_sounds`             | Read trending sounds from Discover       |
+| `tiktok_trending_topics`    | Read trending topics/hashtags from Discover |
 | `tiktok_operation_status` | Poll an asynchronous browser job          |
 | `tiktok_follow`           | Follow a user                             |
 | `tiktok_unfollow`         | Stop following a user                     |

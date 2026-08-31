@@ -15,6 +15,7 @@ import {
   searchByType,
   soundsFeed,
   trendingFeed,
+  trendingTopicsFeed,
   unfollowUser,
   unlikeVideo,
   updateAvatar,
@@ -443,6 +444,11 @@ export class LocalTikTokRuntime {
   sounds(input: { account_id?: string; country?: string; limit?: number }) {
     if (input.account_id) this.common(input.account_id);
     return soundsFeed(input);
+  }
+
+  trendingTopics(input: { account_id?: string; country?: string; limit?: number }) {
+    if (input.account_id) this.common(input.account_id);
+    return trendingTopicsFeed(input);
   }
 
   scheduled(input: { account_id?: string; include_done?: boolean }) {

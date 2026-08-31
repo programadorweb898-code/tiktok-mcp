@@ -3418,3 +3418,121 @@ export async function soundsFeed(req: TikTokSoundsRequest): Promise<TikTokOpResu
   }
 }
 
+export interface TikTokTrendingTopicsRequest {
+  /** Optional local account to read within its authenticated session;
+   *  anonymous otherwise. */
+  account_id?: string;
+  country?: string;
+  /** Max topics to return. Defaults to 20. */
+  limit?: number;
+}
+
+/**
+ * Read the trending topics/hashtags TikTok surfaces on its Discover page, with
+ * real, observed-only links to their `/tag/<slug>` pages together with the
+ * visible text (title, "X posts"/"X videos" count). Like `tiktok_sounds`, this
+ * never fabricates a ranking: it reports whatever links and text are actually
+ * on the page, keyed off the stable `/tag/<slug>` URL shape. The exact Discover
+ * DOM could not be captured in this development environment, so it uses
+ * resilient structural scraping and never guesses when the page fails to render
+ * (returns NOT_READY).
+ */
+export async function trendingTopicsFeed(req: TikTokTrendingTopicsRequest): Promise<TikTokOpResult<{ source: string; results: any[]; total_observed: number }>> {
+  const limit = req.limit && req.limit > 0 ? Math.min(req.limit, 50) : 20;
+
+  let session;
+  try {
+    session = await launchLocalContext({
+      accountId: req.account_id || "__trending_topics__",
+      cookies: [],
+      country: req.country,
+      loadMedia: false,
+    });
+  } catch (e: any) {
+    return { success: false, error: `Failed to open session: ${e.message}`, error_code: "LAUNCH_FAILED" };
+  }
+
+  const { page, close } = session;
+  try {
+    await page.goto("https://www.tiktok.com/discover", { waitUntil: "domcontentloaded", timeout: 45000 });
+
+    const rendered = await waitForHydrated(
+      page,
+      {
+        label: "trending-topics",
+        predicate: `(() => {
+          const links = document.querySelectorAll('a[href]');
+          let n = 0;
+          for (const a of links) {
+            if (/\\/tag\\/[^/?#]+/.test(a.getAttribute('href') || '')) n++;
+          }
+          return n > 0 ? 'rendered' : null;
+        })()`,
+      },
+      { timeoutMs: 30000 },
+    );
+
+    if (!rendered) {
+      const bodyText = (await page.evaluate(`document.body ? (document.body.textContent || '') : ''`).catch(() => "")) as string;
+      if (bodyText && /trending|#|hashtag|topic/i.test(bodyText)) {
+        return { success: true, data: { source: "discover", results: [], total_observed: 0 } };
+      }
+      const diag = await captureUiState(page, "trending-topics-not-rendered");
+      return {
+        success: false,
+        error: "The Discover page never rendered its trending topics surface, so no topics were read.",
+        error_code: "NOT_READY",
+        data: diag as any,
+      };
+    }
+
+    const scraped: any = await page.evaluate(
+      (lim) => {
+        const out: any[] = [];
+        const seen = new Set();
+        const links = Array.from(document.querySelectorAll("a[href]"));
+        for (const a of links) {
+          const href = a.getAttribute("href") || "";
+          const m = href.match(/\/tag\/([^/?#]+)/);
+          if (!m) continue;
+          const slug = decodeURIComponent(m[1]);
+          const key = `tag/${m[1]}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const el: any = a;
+          const texts: string[] = [];
+          let node: any = el;
+          for (let i = 0; i < 6 && node; i++) {
+            const t = (node.innerText || "").replace(/\s+/g, " ").trim();
+            if (t) texts.unshift(t);
+            node = node.parentElement;
+          }
+          const snippet = texts.reduce((acc, x) => (acc.includes(x) ? acc : acc + " · " + x), "");
+          const postsMatch = snippet.match(/([\d.,]+\s*[KMB]?)\s*(posts|videos)/i);
+          out.push({
+            hashtag: slug.startsWith("#") ? slug : `#${slug}`,
+            url: `https://www.tiktok.com/tag/${m[1]}`,
+            snippet: snippet.slice(0, 400),
+            posts_count: postsMatch ? postsMatch[1] : null,
+          });
+          if (out.length >= lim) break;
+        }
+        return out;
+      },
+      limit,
+    ).catch((e: any) => ({ error: String(e?.message || e) }));
+
+    if (!scraped || scraped.error) {
+      const diag = await captureUiState(page, "trending-topics-scrape-failed");
+      return { success: false, error: "Could not read the trending topics surface (unexpected structure).", error_code: "UI_TIMEOUT", data: diag as any };
+    }
+
+    return { success: true, data: { source: "discover", results: scraped as any[], total_observed: (scraped as any[]).length } };
+  } catch (e: any) {
+    const diag = await captureUiState(page, "trending-topics-error").catch(() => ({}));
+    return { success: false, error: e.message || String(e), error_code: "UNKNOWN", data: diag as any };
+  } finally {
+    await close();
+  }
+}
+
