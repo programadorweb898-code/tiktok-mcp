@@ -13,6 +13,7 @@ import {
   postVideo,
   searchByType,
   trendingFeed,
+  unfollowUser,
   unlikeVideo,
   updateAvatar,
   updateProfile,
@@ -310,6 +311,10 @@ export class LocalTikTokRuntime {
 
   follow(input: { account_id: string; target_user: string }) {
     return this.start("follow", input.account_id, input, (common) => followUser({ ...common, ...input }));
+  }
+
+  unfollow(input: { account_id: string; target_user: string }) {
+    return this.start("follow", input.account_id, input, (common) => unfollowUser({ ...common, ...input }));
   }
 
   like(input: { account_id: string; video_url: string }) {

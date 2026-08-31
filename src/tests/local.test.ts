@@ -34,7 +34,7 @@ test("persists local accounts and sparse analytics without hosted automation cal
   assert.equal(latestForAccount("brand")[0]?.views, 10);
 });
 
-test("exposes 28 local tools with no payment fields", async () => {
+test("exposes 29 local tools with no payment fields", async () => {
   const fake = { niches: () => ({ count: 1, niches: [{ id: "test" }] }) } as unknown as LocalTikTokRuntime;
   const server = createTikTokServer({ runtime: fake });
   const client = new Client({ name: "test", version: "1.0.0" });
@@ -42,7 +42,7 @@ test("exposes 28 local tools with no payment fields", async () => {
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
   try {
     const listed = await client.listTools();
-    assert.equal(listed.tools.length, 28);
+    assert.equal(listed.tools.length, 29);
     assert.ok(listed.tools.every((tool) => tool.name.startsWith("tiktok_")));
     assert.ok(listed.tools.every((tool) => !(tool.inputSchema.properties as Record<string, unknown> | undefined)?.payment));
     const called = await client.callTool({ name: "tiktok_niches", arguments: {} });

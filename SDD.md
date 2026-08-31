@@ -50,7 +50,7 @@ El sistema combina: MCP (stdio), Playwright con perfiles de navegador persistent
 ```
 Agente MCP (Claude Code, Codex, Hermes, …)
         ↓  stdio (JSON-RPC)
-src/server.ts            — definición y validación de las 28 tools MCP
+src/server.ts            — definición y validación de las 29 tools MCP
         ↓
 LocalTikTokRuntime       — src/runtime/local-runtime.ts
         ↓                (operaciones asíncronas + registro de jobs)
@@ -69,7 +69,7 @@ TikTok (web + TikTok Studio)
 | Archivo | Responsabilidad |
 |---|---|
 | `src/index.ts` | Entrypoint binario (`tiktok-mcp`). Flags: `--data-dir`, `--browser-path`, `--headless`. Transporte stdio. |
-| `src/server.ts` | Registro de las 28 tools con esquemas zod, wrapper `addTool` con captura de errores y devolución estructurada (`structuredContent` + texto JSON). |
+| `src/server.ts` | Registro de las 29 tools con esquemas zod, wrapper `addTool` con captura de errores y devolución estructurada (`structuredContent` + texto JSON). |
 | `src/runtime/local-runtime.ts` | Orquestador. Crea operaciones asíncronas (`pending → running → done/failed/cancelled`), gestiona el flujo de conexión QR, delega en las operaciones. |
 | `src/runtime/tiktok-operations.ts` | Implementación real de cada operación contra TikTok: subida de video, follow, like, delete, perfil, avatar, scraping de analíticas. Incluye helpers de diagnóstico, modales, privacidad, scheduling nativo e interceptor de respuestas API. |
 | `src/runtime/media-mix.ts` | Fusión local de media con `ffmpeg-static` (binario incluido): reemplaza o superpone una pista de audio sobre un video y produce un MP4 listo para `tiktok_post`. |
@@ -98,7 +98,7 @@ Solo puede haber **una sesión de navegador abierta por cuenta a la vez**: `lock
 
 ## 4. Capacidades actuales (tools MCP)
 
-Verificado contra `src/server.ts`. El servidor expone exactamente 28 tools (el test lo afirma).
+Verificado contra `src/server.ts`. El servidor expone exactamente 29 tools (el test lo afirma).
 
 | Tool | Propósito | Parámetros principales | Implementación | Browser/API | Estado | Limitaciones conocidas |
 |---|---|---|---|---|---|---|
@@ -111,6 +111,7 @@ Verificado contra `src/server.ts`. El servidor expone exactamente 28 tools (el t
 | `tiktok_make_duet` | Componer un video duet o stitch | `base_video_*` (exactamente uno), `your_video_*` (exactamente uno), `mode?` (`duet`/`stitch`), `stitch_seconds?` | `media-duet.ts` con ffmpeg: duet = pantalla dividida side-by-side; stitch = `stitch_seconds`s del video ajeno seguidos del propio; detecta audio por clip y mezcla/concatena o usa silencio | Local (ffmpeg) | IMPLEMENTADO | El editor nativo de Duet/Stitch es solo app móvil; acá se compone el MP4 equivalente que suben los creadores de PC; devuelve `output_path` |
 | `tiktok_operation_status` | Consultar job asíncrono | `operation_id` | Lectura del registro de operaciones | — | IMPLEMENTADO | Los registros se podan a 2.000 operaciones |
 | `tiktok_follow` | Seguir usuario | `account_id`, `target_user` | Perfil público; probe de hidratación de acciones; intercepta `commit/follow/user` o `passport/web/user/follow`; fallback: flip del botón; "ya siguiendo" es éxito legítimo | Browser + intercepción API interna | IMPLEMENTADO | Perfiles privados/restringidos pueden no exponer control |
+| `tiktok_unfollow` | Dejar de seguir usuario | `account_id`, `target_user` | Perfil público; probe de hidratación de acciones; resuelve el botón SOLO en estado Following/Friends/Requested (invierte la exclusión de follow para nunca click-to-follow); confirma el diálogo "Unfollow?" si aparece; intercepta `commit/follow/user` o `passport/web/user/follow`; verifica por read-back el flip del botón de vuelta a Follow; "ya no siguiendo" es no-op exitoso | Browser + intercepción API interna + read-back | IMPLEMENTADO (v1; requiere validación manual) | Perfiles privados/restringidos pueden no exponer control; el DOM del perfil no se pudo inspeccionar en desarrollo → selectores resilientes + validación manual |
 | `tiktok_like` | Dar like a un video | `account_id`, `video_url` | Página watch; probe de hidratación del rail; intercepta `commit/item/digg` | Browser + intercepción API interna | IMPLEMENTADO | Requiere permalink `/video/<id>`; es un toggle: si el video ya está likeado, un like repetido lo deslikea (ver `tiktok_unlike`) |
 | `tiktok_unlike` | Quitar like de un video | `account_id`, `video_url` | Página watch; probe de hidratación del rail; lee `aria-pressed` del botón de like (si no está likeado → no-op); intercepta `commit/item/digg`; verifica por read-back que `aria-pressed` quedó en false | Browser + intercepción API interna + read-back | IMPLEMENTADO (v1; requiere validación manual) | Requiere permalink `/video/<id>`; el estado se lee del `aria-pressed` del botón (si TikTok rota ese atributo hay que revalidar); el DOM del watch page no se pudo inspeccionar en desarrollo |
 | `tiktok_comment` | Comentar en el video de otro usuario | `account_id`, `video_url`, `comment` (1-2200) | Visita el permalink `/video/<id>`; espera el rail de engagement hidratado; resuelve el campo de comentario (data-e2e → placeholder → editor) y abre el rail vía el icono de comentarios si es lazy; escribe y envía con Enter; verifica por read-back (el campo se vacía Y el texto aparece publicado) | Browser | IMPLEMENTADO (v1; requiere validación manual) | El DOM del watch page no se pudo inspeccionar en desarrollo → selectores resilientes + read-back; nunca reporta éxito sin observar el comentario publicado (si queda dudoso devuelve `UI_TIMEOUT` y pide verificar antes de reenviar) |
@@ -172,7 +173,7 @@ Estados: `IMPLEMENTED` · `PARTIAL` · `PLANNED` · `RESEARCH` · `BLOCKED` · `
 | like | IMPLEMENTED | `tiktok_like` |
 | unlike | PARTIAL (v1) | `tiktok_unlike` lee `aria-pressed` del botón antes de clickear (nunca togglea al revés), intercepta `commit/item/digg` y verifica por read-back que el like desapareció; validación manual pendiente |
 | follow | IMPLEMENTED | `tiktok_follow` |
-| unfollow | RESEARCH | — |
+| unfollow | PARTIAL (v1) | `tiktok_unfollow` resuelve el botón solo en estado Following/Friends/Requested, confirma el diálogo si aparece, intercepta el endpoint de unfollow y verifica por read-back el flip de vuelta a Follow; if no-op cuando ya no se sigue; validación manual pendiente |
 | comment | PARTIAL (v1) | `tiktok_comment` publica un comentario en el video de otro usuario (watch page), verificado por read-back. El DOM del watch page no se inspeccionó en desarrollo → selectores resilientes + validación manual pendiente |
 | reply | PLANNED | Fase 2 (ya existe `tiktok_comment_reply` como "responder comentarios" en Analytics/Studio) |
 | delete comment | PLANNED | Fase 2 |
@@ -329,7 +330,7 @@ Separación estricta entre datos observados de TikTok y cálculo local:
 
 Actual (`npm test` = build + `node --test dist/tests/local.test.js`, framework `node:test`):
 
-- Unitarios/integración local: persistencia de cuentas y muestras de analíticas (recordSample dedup, series, latest), contrato de las 28 tools vía `InMemoryTransport` (nombres, ausencia de campos de pago, llamada a `tiktok_niches`), arranque real del binario empaquetado por stdio, contrato HTTP del cliente QR relay (con fetch inyectado). La fusión de media (`tiktok_mix_media`), el quiz visual (`tiktok_make_quiz`) y el duet/stitch (`tiktok_make_duet`) se validan con una ejecución manual real de `ffmpeg` sobre archivos de prueba; no hay test automatizado del binario. `tiktok_monetization_status` se implementó sin poder inspeccionar el DOM real (requiere cuenta apta autenticada): su validación final es manual. Igual para `tiktok_comment_reply`, que depende del DOM de Comment Management (requiere una cuenta con comentarios): validación final manual. `tiktok_pin_video`, que depende del menú de acciones del video, también requiere validación manual contra una cuenta real. `tiktok_playlist_manage` comparte la misma situación: solo está disponible para cuentas con 10k+ seguidores, así que su validación final es manual contra una cuenta apta. `tiktok_search` también se implementó sin inspeccionar el DOM de resultados en desarrollo (búsqueda pública): se lee por links reales + texto visible y su validación final es manual. `tiktok_comment` comparte la situación del watch page (DOM de comentarios no inspeccionado en desarrollo): selectores resilientes + read-back, validación final manual contra una cuenta real. `tiktok_unlike`, al depender del atributo `aria-pressed` del botón de like en el watch page (misma superficie no inspeccionada en desarrollo), también requiere validación manual: se debe confirmar que el like desaparece realmente. `tiktok_comments`, al depender del DOM de Comment Management (misma superficie que `tiktok_comment_reply`), también requiere validación manual contra una cuenta real con comentarios.
+- Unitarios/integración local: persistencia de cuentas y muestras de analíticas (recordSample dedup, series, latest), contrato de las 29 tools vía `InMemoryTransport` (nombres, ausencia de campos de pago, llamada a `tiktok_niches`), arranque real del binario empaquetado por stdio, contrato HTTP del cliente QR relay (con fetch inyectado). La fusión de media (`tiktok_mix_media`), el quiz visual (`tiktok_make_quiz`) y el duet/stitch (`tiktok_make_duet`) se validan con una ejecución manual real de `ffmpeg` sobre archivos de prueba; no hay test automatizado del binario. `tiktok_monetization_status` se implementó sin poder inspeccionar el DOM real (requiere cuenta apta autenticada): su validación final es manual. Igual para `tiktok_comment_reply`, que depende del DOM de Comment Management (requiere una cuenta con comentarios): validación final manual. `tiktok_pin_video`, que depende del menú de acciones del video, también requiere validación manual contra una cuenta real. `tiktok_playlist_manage` comparte la misma situación: solo está disponible para cuentas con 10k+ seguidores, así que su validación final es manual contra una cuenta apta. `tiktok_search` también se implementó sin inspeccionar el DOM de resultados en desarrollo (búsqueda pública): se lee por links reales + texto visible y su validación final es manual. `tiktok_comment` comparte la situación del watch page (DOM de comentarios no inspeccionado en desarrollo): selectores resilientes + read-back, validación final manual contra una cuenta real. `tiktok_unlike`, al depender del atributo `aria-pressed` del botón de like en el watch page (misma superficie no inspeccionada en desarrollo), también requiere validación manual: se debe confirmar que el like desaparece realmente. `tiktok_unfollow`, al depender del estado textual del botón de follow en el perfil público y del posible diálogo de confirmación (superficie no inspeccionada en desarrollo), también requiere validación manual contra una cuenta con seguidores. `tiktok_comments`, al depender del DOM de Comment Management (misma superficie que `tiktok_comment_reply`), también requiere validación manual contra una cuenta real con comentarios.
 - **No existen tests de browser contra TikTok real automatizados.**
 
 Estrategia definida:
@@ -382,7 +383,7 @@ Estrategia definida:
 | Fase | Alcance | Estado |
 |---|---|---|
 | 1 | Estabilizar el MCP existente: comprender la arquitectura, pruebas, endurecer selectores y errores | En curso |
-| 2 | Completar engagement: unlike/unfollow, comentarios (leer, escribir, responder, borrar) | En curso (escribir comentarios `tiktok_comment`; leer comentarios `tiktok_comments`; response en Studio `tiktok_comment_reply`; unlike `tiktok_unlike`; follow/unfollow/borrar comentarios pendientes) |
+| 2 | Completar engagement: unlike/unfollow, comentarios (leer, escribir, responder, borrar) | En curso (escribir comentarios `tiktok_comment`; leer comentarios `tiktok_comments`; response en Studio `tiktok_comment_reply`; unlike `tiktok_unlike`; unfollow `tiktok_unfollow`; borrar comentarios pendiente) |
 | 3 | Discovery y trends: búsquedas (videos/usuarios/hashtags), tendencias, sounds | En curso (búsqueda implementada `tiktok_search`; tendencias/sounds pendientes) |
 | 4 | Analytics avanzados: analíticas de perfil, métricas profundas de Studio, histórico más rico | Planificado |
 | 5 | LIVE: descubrimiento, información e interacción | Planificado |
@@ -550,6 +551,18 @@ Decisión: implementar `tiktok_unlike` reutilizando el patrón de `likeVideo` (p
 Motivo: el like de TikTok es un toggle; sin leer el estado, un "unlike" sobre un video no likeado convertiría por error un no-op en un like. Leer el estado del botón elimina esa ambigüedad y complementa el ciclo de engagement inverso (like/unlike).
 Alternativas consideradas: leer el estado de la clase CSS del botón (rechazado: más frágil que `aria-pressed`); interceptar el endpoint de estado de relación (rechazado: no se inventa sin observar).
 Consecuencias: la tool es asíncrona (job) y depende del atributo `aria-pressed` del botón de like en el watch page — si TikTok rota ese atributo hay que revalidar; misma superficie sin inspeccionar en desarrollo que `tiktok_like`/`tiktok_comment`, por lo que su validación final es manual contra una cuenta real. Conteo pasa de 27 a 28 tools.
+
+---
+
+## DEC-015 — Unfollow idempotente invirtiendo la exclusión del botón follow
+
+Fecha: 2026-08-31
+
+Estado: Aceptada (implementada v1, validación manual pendiente)
+Decisión: implementar `tiktok_unfollow` reutilizando el patrón de `followUser` (perfil público, probe de hidratación de acciones, intercepción de `commit/follow/user` o `passport/web/user/follow`) pero invirtiendo la guarda: resolve el botón SOLO en estado Following/Friends/Requested (donde follow lo excluye para nunca click-to-unfollow), de modo que nunca clickea salvo que ya se siga; si el botón no está en estado following, devuelve un no-op exitoso `{ unfollowed: false, was_following: false }`. Al clickear, TikTok puede mostrar un diálogo de confirmación ("Unfollow @handle?") — se resuelve y confirma si aparece. Verifica por read-back que el botón flipea de vuelta a Follow (si no, `UI_TIMEOUT` y no reejecutar a ciegas). Comparte el bucket de rate limit "follow" (20/hora).
+Motivo: el follow de TikTok es un toggle; sin leer el estado, un "unfollow" que ya no sigue convertiría por error un no-op en un follow. Además, TikTok puede pedir confirmación explícita que una operación de unfollow debe manejar para reportar con honestidad.
+Alternativas consideradas: click directo al botón "Following" sin confirmar el diálogo (rechazado: el diálogo puede quedar abierto o anular la acción, y el read-back no confirmaría el flip); interceptar el endpoint de estado de relación (rechazado: no se inventa sin observar).
+Consecuencias: la tool es asíncrona (job) y depende del texto del botón de follow en el perfil público (Follow vs Following/Friends/Requested) y del posible diálogo de confirmación — superficie no inspeccionada en desarrollo, por lo que su validación final es manual contra una cuenta con seguidores. Conteo pasa de 28 a 29 tools.
 
 ---
 

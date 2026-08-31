@@ -173,6 +173,12 @@ export function createTikTokServer(options: TikTokServerOptions = {}): McpServer
     inputSchema: { account_id: ACCOUNT_ID, target_user: z.string().min(1) },
   }, (args) => runtime.follow(args as any));
 
+  addTool(server, "tiktok_unfollow", {
+    title: "Unfollow a TikTok user",
+    description: "Stop following a user from a connected local profile. Reads the follow button's state first (only clicks when currently Following/Friends/Requested), confirms the dialog if shown, and verifies the flip back to Follow; already-not-following is a no-op.",
+    inputSchema: { account_id: ACCOUNT_ID, target_user: z.string().min(1) },
+  }, (args) => runtime.unfollow(args as any));
+
   addTool(server, "tiktok_like", {
     title: "Like a TikTok video",
     description: "Like a video from a connected local profile.",

@@ -1057,6 +1057,125 @@ export async function followUser(req: TikTokFollowRequest): Promise<TikTokOpResu
   }
 }
 
+export async function unfollowUser(req: TikTokFollowRequest): Promise<TikTokOpResult<{ unfollowed: boolean; was_following: boolean }>> {
+  const blocked = gate(req.account_id, "follow");
+  if (blocked) return blocked;
+
+  const handle = req.target_user.replace(/^@/, "").trim();
+  if (!/^[A-Za-z0-9._]{2,24}$/.test(handle)) {
+    return { success: false, error: "target_user must be a valid TikTok handle", error_code: "INVALID_INPUT" };
+  }
+
+  let session;
+  try {
+    session = await openAuthenticatedSession({
+      accountId: req.account_id,
+      proxySessionId: req.proxy_session_id,
+      cookies: req.cookies,
+      country: req.country,
+    });
+  } catch (e: any) {
+    return { success: false, error: `Failed to open session: ${e.message}`, error_code: "LAUNCH_FAILED" };
+  }
+
+  const { page, close } = session;
+  try {
+    await page.goto(`https://www.tiktok.com/@${handle}`, { waitUntil: "domcontentloaded", timeout: 45000 });
+
+    const actionsReady = await waitForHydrated(page, HYDRATION_PROBES.profileActions, { timeoutMs: 30000 });
+    if (!actionsReady) {
+      const diag = await captureUiState(page, "unfollow-actions-not-hydrated");
+      return {
+        success: false,
+        error: `@${handle}'s profile loaded but its action buttons never rendered, so the follow control could not be read. This is a page-readiness failure, not a confirmed state of the account.`,
+        error_code: "NOT_READY",
+        data: diag as any,
+      };
+    }
+
+    if (await dismissBlockingModal(page, 6000)) console.error("[tiktok] dismissed a modal covering the follow control");
+
+    // Resolve the button in the FOLLOWING state (Following/Friends/Requested).
+    // We must only click it when we ARE following, so the Follow state is
+    // excluded — inverting follow's "never click-to-unfollow" guard so we never
+    // accidentally click-to-follow.
+    const following = await resolveElement(page, [
+      { name: "data-e2e", build: (p) => p.locator('[data-e2e="follow-button"]:has-text("Following"), [data-e2e="follow-button"]:has-text("Friends"), [data-e2e="follow-button"]:has-text("Requested")') },
+      { name: "text", build: (p) => p.locator('button:has-text("Following"):not(:has-text("Follow ")).not(:has-text("Followers")), [role="button"]:has-text("Following"):not(:has-text("Follow ")).not(:has-text("Followers"))') },
+    ], { perStrategyMs: 8000 });
+
+    if (!following) {
+      // The row IS rendered and no Following-state control is in it — so we are
+      // NOT currently following. That satisfies the intent (already unfollowed).
+      const diag = await captureUiState(page, "unfollow-not-following");
+      console.error(`[tiktok] not following @${handle} — treating as satisfied`);
+      return { success: true, data: { unfollowed: false, was_following: false } };
+    }
+    console.error(`[tiktok] following button resolved via ${following.strategy}`);
+
+    await following.locator.click({ timeout: 10000 });
+    await page.waitForTimeout(900);
+
+    // TikTok shows a confirmation dialog ("Unfollow @handle?") with Unfollow/Cancel.
+    const confirm = await resolveElement(page, [
+      { name: "role-name", build: (p) => p.getByRole("button", { name: /^unfollow$/i }) },
+      { name: "text", build: (p) => p.getByText(/^unfollow$/i) },
+    ], { perStrategyMs: 6000 }).catch(() => null);
+
+    if (confirm) {
+      const result = await submitAndAwaitTikTokApi(
+        page,
+        async () => { await confirm.locator.click({ timeout: 10000 }); },
+        /\/aweme\/v\d+\/(web\/)?commit\/follow\/user|\/passport\/web\/user\/follow/,
+        20000,
+      );
+      if (result && !result.ok) {
+        return {
+          success: false,
+          error: result.errorMessage || `HTTP ${result.status}`,
+          error_code: mapTikTokError(result.status, result.statusCode),
+        };
+      }
+    } else {
+      // No confirm dialog — the button click itself may have been the unfollow.
+      const result = await submitAndAwaitTikTokApi(
+        page,
+        async () => {},
+        /\/aweme\/v\d+\/(web\/)?commit\/follow\/user|\/passport\/web\/user\/follow/,
+        15000,
+      );
+      if (result && !result.ok) {
+        return {
+          success: false,
+          error: result.errorMessage || `HTTP ${result.status}`,
+          error_code: mapTikTokError(result.status, result.statusCode),
+        };
+      }
+    }
+
+    // VERIFY by read-back: the button must flip to Follow (not Following).
+    const flipped = await page.locator('[data-e2e="follow-button"]:has-text("Follow"):not(:has-text("Following"))')
+      .first().isVisible({ timeout: 8000 }).catch(() => false);
+    if (!flipped) {
+      const diag = await captureUiState(page, "unfollow-verify");
+      return {
+        success: false,
+        error: `@${handle} did not confirm the unfollow (button did not flip back to Follow). The state may or may not have changed — do not re-run blindly.`,
+        error_code: "UI_TIMEOUT",
+        data: diag as any,
+      };
+    }
+
+    recordAction(req.account_id, "tiktok", "follow");
+    return { success: true, data: { unfollowed: true, was_following: true } };
+  } catch (e: any) {
+    const diag = await captureUiState(page, "unfollow-error").catch(() => ({}));
+    return { success: false, error: e.message || String(e), error_code: "UNKNOWN", data: diag as any };
+  } finally {
+    await close();
+  }
+}
+
 export interface TikTokLikeRequest extends TikTokOpRequest {
   /** Full TikTok video URL — e.g. https://www.tiktok.com/@handle/video/1234567890 */
   video_url: string;
