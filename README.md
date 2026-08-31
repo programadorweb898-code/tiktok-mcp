@@ -24,6 +24,15 @@ You can connect unlimited number of accounts. The agent will keep all TikTok ses
 | `tiktok_connect_status`   | Check whether login completed             |
 | `tiktok_accounts`         | List local accounts and session state     |
 | `tiktok_post`             | Post or natively schedule a video         |
+| `tiktok_mix_media`        | Merge a separate audio track into a video (use a sound) |
+| `tiktok_make_quiz`        | Burn a question + options onto a video    |
+| `tiktok_make_duet`        | Compose a duet (split screen) or stitch MP4 |
+| `tiktok_monetization_status` | Read monetization status from TikTok Studio |
+| `tiktok_comment_reply`       | Reply to a comment in TikTok Studio's Comment Management |
+| `tiktok_pin_video`           | Pin or unpin a video on the profile |
+| `tiktok_playlist_manage`     | Create a playlist, or add/remove a post from one |
+| `tiktok_search`             | Search TikTok (videos, users, hashtags) |
+| `tiktok_trending`           | Read the For You feed (trending for you) |
 | `tiktok_operation_status` | Poll an asynchronous browser job          |
 | `tiktok_follow`           | Follow a user                             |
 | `tiktok_like`             | Like a video                              |

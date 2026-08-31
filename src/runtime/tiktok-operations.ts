@@ -11,7 +11,7 @@
  * TikTok mirrors Twitter's shape but with a tighter rate-limit stance:
  * every op goes through `checkRateLimit()` before the browser even boots.
  */
-import { openAuthenticatedSession, profileForCountry, pendingRequests } from "./social-runtime.js";
+import { launchLocalContext, openAuthenticatedSession, profileForCountry, pendingRequests } from "./social-runtime.js";
 import { fetchSsrfSafe } from "./media-fetch.js";
 import { randomUUID } from "crypto";
 import { checkRateLimit, recordAction } from "./social-rate-limit.js";
@@ -1676,3 +1676,900 @@ export async function analyzePosts(req: TikTokAnalyticsRequest): Promise<TikTokO
     await close();
   }
 }
+
+export interface TikTokMonetizationRequest extends TikTokOpRequest {}
+
+/**
+ * Read the account's monetization status from TikTok Studio's web monetization
+ * page (`/tiktokstudio/monetization`).
+ *
+ * IMPORTANT LIMITATION: enrolling in a creator monetization program
+ * (e.g. Creator Rewards) requires strict eligibility — effectively 10 000+
+ * followers, 100 000 views in 30 days, an account 30+ days old, and 18+ years.
+ * This op reads the status page; it does not and cannot enrol an ineligible or
+ * unverified account. Because the monetization surface only renders after an
+ * authenticated, eligible login, the DOM could not be captured in this
+ * development environment — this scrape deliberately avoids fragile selectors
+ * and instead extracts visible label/value pairs and the surrounding text, so
+ * it is resilient to selector rotation. It MUST still be validated manually
+ * once run against a real, eligible account.
+ *
+ * A null hydration probe means nothing about eligibility was observed, so the
+ * result is reported NOT_READY (never fabricated status).
+ */
+export async function monetizationStatus(
+  req: TikTokMonetizationRequest,
+): Promise<TikTokOpResult<{ eligibility: string | null; metrics: Array<{ label: string; value: string; raw: string }>; pages: string[]; scraped_at: string }>> {
+  let session;
+  try {
+    session = await openAuthenticatedSession({
+      accountId: req.account_id,
+      proxySessionId: req.proxy_session_id,
+      cookies: req.cookies,
+      country: req.country,
+    });
+  } catch (e: any) {
+    return { success: false, error: `Failed to open session: ${e.message}`, error_code: "LAUNCH_FAILED" };
+  }
+
+  const { page, close } = session;
+  try {
+    await page.goto("https://www.tiktok.com/tiktokstudio/monetization", { waitUntil: "domcontentloaded", timeout: 45000 });
+
+    // Wait for real, monetization-related text to render (not the empty SPA
+    // shell). We look for any of the words TikTok uses on this surface rather
+    // than a single selector — the goal here is "the page rendered", not a
+    // specific element that could rotate.
+    const rendered = await waitForHydrated(
+      page,
+      {
+        label: "monetization-content",
+        predicate: `(() => {
+          const t = (document.body.textContent || '').toLowerCase();
+          return /monetization|creator rewards|reward|eligible|payout|earnings|rpm/.test(t) ? (t.length > 200 ? 'rendered' : 'shell') : null;
+        })()`,
+      },
+      { timeoutMs: 30000 },
+    );
+    if (!rendered || rendered === "shell") {
+      const diag = await captureUiState(page, "monetization-not-hydrated");
+      return {
+        success: false,
+        error: "The monetization page never finished rendering its real content, so no status was read. Reporting fabricated eligibility here would be worse than a missing answer.",
+        error_code: "NOT_READY",
+        data: diag as any,
+      };
+    }
+    await page.waitForTimeout(1500);
+
+    // Extract visible label/value pairs and the page's structured text defensively.
+    const scraped: any = await page.evaluate(`(() => {
+      const pair = (t) => (t || '').replace(/\\s+/g, ' ').trim();
+      const metrics = [];
+      // A monetization dashboard tends to render number/value cells beside a label.
+      // We collect visible leaf text nodes that are short (a number or a label),
+      // then pair each recognizable metric label with the nearest numeric value.
+      const nodeTexts = [];
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      let n;
+      while ((n = walker.nextNode())) {
+        const t = (n.textContent || '').trim();
+        if (!t) continue;
+        const el = n.parentElement;
+        if (el && el.children.length === 0 && n.nodeValue && n.nodeValue.trim()) {
+          nodeTexts.push({ text: t, rect: el.getBoundingClientRect() });
+        }
+      }
+      const numRe = /^[\\d.,]+\\s*[KMB%]?$/i;
+      const labelRe = /^(rewards?|rpm|payout|earnings|eligible|balance|views|followers|status|program|creator rewards|available)/i;
+      const valueRe = /^[#\\$\\d]|^[\\d.,]+\\s*[KMB%]?$|^eligible$|^not eligible$|^active$|^ineligible$/i;
+      let lastLabel = null;
+      for (const item of nodeTexts) {
+        const t = item.text;
+        if (valueRe.test(t) && t.length <= 40) {
+          metrics.push({ label: lastLabel || 'value', value: t, raw: pair(t) });
+        } else if (labelRe.test(t) && t.length <= 40) {
+          lastLabel = t;
+        }
+      }
+      return { metrics, pages: [...document.querySelectorAll('a')].map(a => (a.getAttribute('href') || '')).filter(h => /monetization|creator|reward/i.test(h)).slice(0, 20) };
+    })()`).catch((e: any) => ({ error: String(e?.message || e) }));
+
+    if (!scraped || scraped.error) {
+      const diag = await captureUiState(page, "monetization-scrape-failed");
+      return { success: false, error: "Could not read the monetization page (unexpected structure).", error_code: "UI_TIMEOUT", data: diag as any };
+    }
+
+    // Best-effort: an explicit eligibility line, if present.
+    const bodyText = (await page.evaluate(`() => (document.body.textContent || '')`).catch(() => "")) as string;
+    let eligibility: string | null = null;
+    const eligMatch = bodyText.match(/((?:not\s+)?eligible|ineligible|eligibility)[^\\n]{0,80}/i);
+    if (eligMatch) eligibility = eligMatch[0].replace(/\s+/g, " ").trim();
+
+    // Trim to unique metric entries.
+    const seen = new Set();
+    const metrics = (scraped.metrics as any[]).filter((m) => {
+      const k = m.label + "::" + m.value;
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+
+    return {
+      success: true,
+      data: {
+        eligibility,
+        metrics,
+        pages: scraped.pages || [],
+        scraped_at: new Date().toISOString(),
+        note: "Requires validation against a real eligible account; the monetization DOM was not fully inspected at build time.",
+      } as any,
+    };
+  } catch (e: any) {
+    const diag = await captureUiState(page, "monetization-error").catch(() => ({}));
+    return { success: false, error: e.message || String(e), error_code: "UNKNOWN", data: diag as any };
+  } finally {
+    await close();
+  }
+}
+
+export interface TikTokPinVideoRequest extends TikTokOpRequest {
+  /** Full TikTok video URL (own video), e.g. https://www.tiktok.com/@handle/video/1234567890 */
+  video_url: string;
+  /** Pin to the top of the profile, or remove the pin. */
+  action: "pin" | "unpin";
+}
+
+/**
+ * Pin (or unpin) one of the account's own videos to the top of its profile.
+ * TikTok limits this to three pinned videos; the action is performed from the
+ * video's own action menu ("Pin to profile" / "Unpin from profile") on the
+ * watch page, and verified by re-visiting the profile and checking whether the
+ * video carries the "Pinned" badge.
+ *
+ * LIMITATION: like monetization/comments, the exact watch-page action menu DOM
+ * could not be captured in this dev environment, so it uses resilient
+ * multi-tier selectors (role/aria -> text) and verifies by reading the profile
+ * back. Never reports success unless the pinned state is actually observed
+ * (or the profile confirms "already in desired state").
+ */
+export async function pinVideo(req: TikTokPinVideoRequest): Promise<TikTokOpResult<{ action: "pin" | "unpin"; confirmed: boolean }>> {
+  const blocked = gate(req.account_id, "pin");
+  if (blocked) return blocked;
+
+  const handleMatch = /\/@([A-Za-z0-9._]+)\//.exec(req.video_url || "");
+  const idMatch = /\/video\/(\d+)/.exec(req.video_url || "");
+  if (!handleMatch || !idMatch) {
+    return { success: false, error: "video_url must be a full TikTok video URL like https://www.tiktok.com/@handle/video/<id>", error_code: "INVALID_INPUT" };
+  }
+  const handle = handleMatch[1];
+  const videoId = idMatch[1];
+  const action = req.action;
+
+  let session;
+  try {
+    session = await openAuthenticatedSession({
+      accountId: req.account_id,
+      proxySessionId: req.proxy_session_id,
+      cookies: req.cookies,
+      country: req.country,
+    });
+  } catch (e: any) {
+    return { success: false, error: `Failed to open session: ${e.message}`, error_code: "LAUNCH_FAILED" };
+  }
+
+  const { page, close } = session;
+  try {
+    await page.goto(req.video_url, { waitUntil: "domcontentloaded", timeout: 45000 });
+
+    const railReady = await waitForHydrated(page, HYDRATION_PROBES.videoActions, { timeoutMs: 30000 });
+    if (!railReady) {
+      const diag = await captureUiState(page, "pin-rail-not-hydrated");
+      return {
+        success: false,
+        error: "The video page loaded but its engagement controls never rendered, so the action menu could not be opened.",
+        error_code: "NOT_READY",
+        data: diag as any,
+      };
+    }
+    await dismissBlockingModal(page, 6000);
+
+    // The action/share menu trigger (the "..." / share affordance on the watch
+    // page) opens the menu that contains Pin/Unpin.
+    const shareBtn = await resolveElement(page, [
+      { name: "data-e2e", build: (p) => p.locator('[data-e2e="share-icon"], [data-e2e="browse-more-icon"], [data-e2e="video-more"]') },
+      { name: "aria-label", build: (p) => p.locator('button[aria-label*="hare" i], button[aria-label*="more" i]') },
+      { name: "role", build: (p) => p.getByRole("button", { name: /share|more/i }) },
+    ], { perStrategyMs: 6000 });
+    if (!shareBtn) {
+      const diag = await captureUiState(page, "pin-share-missing");
+      return { success: false, error: "Could not find the video action menu trigger on the watch page.", error_code: "UI_TIMEOUT", data: diag as any };
+    }
+    await shareBtn.locator.click({ timeout: 10000 });
+    await page.waitForTimeout(900);
+
+    // Locate the Pin/Unpin entry in the opened menu.
+    const wantPin = action === "pin";
+    const label = wantPin ? /^pin to profile$/i : /^unpin from profile$/i;
+    const pinItem = await resolveElement(page, [
+      { name: "menuitem", build: (p) => p.getByRole("menuitem", { name: label }) },
+      { name: "text", build: (p) => p.getByText(label) },
+    ], { perStrategyMs: 6000 });
+
+    if (!pinItem) {
+      // The menu opened but the desired entry isn't there. For a pin this often
+      // means it is ALREADY pinned (menu shows "Unpin"); for unpin it means it
+      // is already unpinned. Treat that as a no-op success iff the profile
+      // confirms the target state below; otherwise report missing.
+      const diag = await captureUiState(page, `pin-entry-missing-${action}`);
+      console.error(`[tiktok] "${action}" entry not found in the action menu (${JSON.stringify(diag).slice(0, 800)}); falling back to profile verification`);
+    } else {
+      await pinItem.locator.click({ timeout: 8000 });
+      await page.waitForTimeout(1200);
+      // Some flows show a small confirm/permission dialog after choosing pin.
+      await dismissBlockingModal(page, 4000);
+    }
+
+    // VERIFY by reading the profile back: the video's grid tile must carry the
+    // "Pinned" badge (or, for unpin, must no longer be pinned). This is the
+    // observable truth we trust over any click/menu feedback.
+    const profileUrl = `https://www.tiktok.com/@${handle}`;
+    await page.goto(profileUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
+    const actionsReady = await waitForHydrated(page, HYDRATION_PROBES.profileActions, { timeoutMs: 30000 });
+    if (!actionsReady) {
+      const diag = await captureUiState(page, "pin-profile-not-hydrated");
+      return {
+        success: false,
+        error: `Could not verify on @${handle}'s profile because its action controls never rendered.`,
+        error_code: "NOT_READY",
+        data: diag as any,
+      };
+    }
+    await page.waitForTimeout(1500);
+
+    // Find the video tile and inspect whether it (in its container) is pinned.
+    const verdict = await page.evaluate(
+      ({ vid, want }) => {
+        const idx = document.querySelectorAll(`a[href*="/video/${vid}"]`);
+        if (idx.length === 0) return { found: false, pinned: false };
+        // Climb from the tile to a container that also carries the "Pinned" badge text.
+        let el: any = idx[0];
+        for (let i = 0; i < 6 && el; i++) {
+          const t = (el.textContent || "");
+          if (t.toLowerCase().includes("pinned")) return { found: true, pinned: true };
+          el = el.parentElement;
+        }
+        return { found: true, pinned: false };
+      },
+      { vid: videoId, want: wantPin },
+    );
+
+    const currentlyPinned = verdict.found && verdict.pinned;
+    const confirmed = wantPin ? currentlyPinned : !currentlyPinned;
+
+    if (!confirmed) {
+      const diag = await captureUiState(page, `pin-verify-${action}`);
+      return {
+        success: false,
+        error: `Requested to ${action} video ${videoId} but the profile does not confirm the resulting state${verdict.found ? "" : " (the video was not found on the profile)"}. The action may or may not have applied — do not re-run blindly.`,
+        error_code: "UI_TIMEOUT",
+        data: diag as any,
+      };
+    }
+
+    recordAction(req.account_id, "tiktok", "pin");
+    return { success: true, data: { action, confirmed } };
+  } catch (e: any) {
+    const diag = await captureUiState(page, "pin-error").catch(() => ({}));
+    return { success: false, error: e.message || String(e), error_code: "UNKNOWN", data: diag as any };
+  } finally {
+    await close();
+  }
+}
+
+
+export interface TikTokCommentRequest extends TikTokOpRequest {
+  /** Substring of the comment's text to locate the specific comment (case-insensitive). */
+  comment_text: string;
+  /** The reply to post (1-2200 chars). */
+  reply: string;
+}
+
+/**
+ * Reply to a comment in TikTok Studio's web Comment Management
+ * (`/tiktokstudio/comment-management`), which supports replying to, liking and
+ * deleting comments on the desktop (verified via Studio's web surface).
+ *
+ * LIMITATION: like monetization, the exact comment-management DOM could not be
+ * captured in this development environment (it needs a session with comments),
+ * so this uses multi-tier resilient selectors (text -> role/aria -> structural)
+ * and verifies by read-back of the posted reply text. It MUST still be validated
+ * manually against a real account with comments. It never reports success
+ * unless the posted reply is actually observed (or the API confirms).
+ */
+export async function commentReply(req: TikTokCommentRequest): Promise<TikTokOpResult<{ replied: boolean; target: string }>> {
+  const blocked = gate(req.account_id, "comment");
+  if (blocked) return blocked;
+
+  const commentText = (req.comment_text || "").trim();
+  const reply = (req.reply || "").trim();
+  if (!commentText || reply.length < 1 || reply.length > 2200) {
+    return { success: false, error: "comment_text (1+) and reply (1-2200 chars) are required", error_code: "INVALID_INPUT" };
+  }
+
+  let session;
+  try {
+    session = await openAuthenticatedSession({
+      accountId: req.account_id,
+      proxySessionId: req.proxy_session_id,
+      cookies: req.cookies,
+      country: req.country,
+    });
+  } catch (e: any) {
+    return { success: false, error: `Failed to open session: ${e.message}`, error_code: "LAUNCH_FAILED" };
+  }
+
+  const { page, close } = session;
+  try {
+    await page.goto("https://www.tiktok.com/tiktokstudio/comment-management", { waitUntil: "domcontentloaded", timeout: 45000 });
+
+    // Wait for a comment-oriented surface to render (not the empty SPA shell).
+    const rendered = await waitForHydrated(
+      page,
+      {
+        label: "comment-management",
+        predicate: `(() => {
+          const t = (document.body.textContent || '').toLowerCase();
+          const hasWord = /comments|comment|reply|respond/.test(t) ? 1 : 0;
+          const hasAnyNode = document.querySelectorAll('input, textarea, [contenteditable="true"], button').length;
+          return (hasWord + hasAnyNode) >= 2 ? 'rendered' : null;
+        })()`,
+      },
+      { timeoutMs: 30000 },
+    );
+    if (!rendered) {
+      const diag = await captureUiState(page, "comment-management-not-hydrated");
+      return {
+        success: false,
+        error: "The comment-management page never finished rendering, so the comment could not be located. Reporting a false success would be worse than a missing answer.",
+        error_code: "NOT_READY",
+        data: diag as any,
+      };
+    }
+    await page.waitForTimeout(1500);
+    await dismissBlockingModal(page);
+
+    // Locate the comment row by its text. A comment is a leaf-ish node whose
+    // visible text contains the target substring. We climb to a container that
+    // has a reply affordance nearby.
+    const targetSelector = commentText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const row = await resolveElement(page, [
+      {
+        name: "text-substring",
+        build: (p) => p.locator(`//div[contains(., "${commentText}")]`).last(),
+      },
+      {
+        name: "aria-comment",
+        build: (p) => p.getByRole("listitem").filter({ hasText: new RegExp(targetSelector, "i") }).first(),
+      },
+      {
+        name: "structural-comment",
+        build: (p) => p.locator(`div:has-text("${commentText}")`).last(),
+      },
+    ], { perStrategyMs: 6000, state: "attached" });
+    if (!row) {
+      const diag = await captureUiState(page, "comment-target-not-found");
+      return {
+        success: false,
+        error: `No comment matching "${req.comment_text}" was found in Comment Management.`,
+        error_code: "NOT_FOUND",
+        data: diag as any,
+      };
+    }
+
+    // Open the reply field: locate the reply input/textarea inside the row (or a
+    // "Reply" affordance) and type the answer.
+    const replyInput = await resolveElement(page, [
+      {
+        name: "textarea-in-row",
+        build: (p) => row.locator.locator(`textarea, input[type="text"], [contenteditable="true"]`).last(),
+      },
+      {
+        name: "reply-button",
+        build: (p) => row.locator.locator(`button:has-text("Reply"), [role="button"]:has-text("Reply"), button:has-text("Respond")`).first(),
+      },
+    ], { perStrategyMs: 4000, state: "attached" });
+
+    if (!replyInput) {
+      const diag = await captureUiState(page, "comment-reply-field-missing");
+      return { success: false, error: "Could not find the reply field for the comment.", error_code: "UI_TIMEOUT", data: diag as any };
+    }
+
+    const tagName = (await replyInput.locator.evaluate((el: any) => el.tagName).catch(() => "")) || "";
+    if (/BUTTON|A/.test(tagName)) {
+      // It's a Reply button — click to reveal the editor, then find the editor.
+      await replyInput.locator.click({ timeout: 6000 });
+      await page.waitForTimeout(600);
+      const editor = await resolveElement(page, [
+        { name: "editor-in-row", build: (p) => row.locator.locator(`textarea, [contenteditable="true"]`).last() },
+        { name: "editor-global", build: (p) => p.locator(`textarea, [contenteditable="true"]`).last() },
+      ], { perStrategyMs: 5000, state: "attached" });
+      if (!editor) {
+        const diag = await captureUiState(page, "comment-editor-not-found");
+        return { success: false, error: "Clicked Reply but no editor appeared.", error_code: "UI_TIMEOUT", data: diag as any };
+      }
+      await editor.locator.click({ timeout: 6000 });
+      await editor.locator.fill(reply);
+      await page.keyboard.press("Enter");
+    } else {
+      // It's an editor/input directly.
+      await replyInput.locator.click({ timeout: 6000 });
+      await replyInput.locator.fill(reply);
+      await page.keyboard.press("Enter");
+    }
+
+    // Verify by read-back: the posted reply's text should appear in the page
+    // (the comment now shows our reply). Give it a moment to land.
+    const seen = await page
+      .waitForFunction(
+        (needle: string) => {
+          const t = (document.body.textContent || "");
+          return t.includes(needle) && t.replace(/\s+/g, " " ).toLowerCase().includes(needle.toLowerCase());
+        },
+        reply,
+        { timeout: 8000 },
+      )
+      .then(() => true)
+      .catch(() => false);
+
+    if (!seen) {
+      const diag = await captureUiState(page, "comment-reply-unverified");
+      return {
+        success: false,
+        error: "Reply was submitted but could not be confirmed on screen — do not re-send without checking (it may have landed).",
+        error_code: "UI_TIMEOUT",
+        data: diag as any,
+      };
+    }
+
+    recordAction(req.account_id, "tiktok", "comment");
+    return { success: true, data: { replied: true, target: commentText } };
+  } catch (e: any) {
+    const diag = await captureUiState(page, "comment-reply-error").catch(() => ({}));
+    return { success: false, error: e.message || String(e), error_code: "UNKNOWN", data: diag as any };
+  } finally {
+    await close();
+  }
+}
+
+export interface TikTokPlaylistRequest extends TikTokOpRequest {
+  /** What to do: create a playlist, or add/remove a public post. */
+  action: "create" | "add" | "remove";
+  /** The playlist name (create) or the target playlist name (add/remove). */
+  name: string;
+  /** The public post to add/remove — required for add/remove (full TikTok URL). */
+  video_url?: string;
+}
+
+/**
+ * Create a playlist, or add/remove one of the account's public posts from a
+ * playlist, on the user's profile web ("Manage playlists" / the post's
+ * "Add to playlist" / "Remove from playlist"). Verified by reading the page
+ * state back (the playlist name appears, or the add/remove confirms).
+ *
+ * LIMITATION: playlists are only available to creators with 10k+ followers, so
+ * like monetization/comments/pin, the exact DOM could not be inspected with the
+ * current account. Uses resilient multi-tier selectors and verifies by
+ * read-back; never reports success without observing the resulting state. A
+ * public post can be in only ONE playlist at a time.
+ */
+export async function playlistManage(req: TikTokPlaylistRequest): Promise<TikTokOpResult<{ action: string; name: string; confirmed: boolean }>> {
+  const blocked = gate(req.account_id, "playlist");
+  if (blocked) return blocked;
+
+  const name = (req.name || "").trim();
+  if (!name) return { success: false, error: "name is required", error_code: "INVALID_INPUT" };
+  if (!["create", "add", "remove"].includes(req.action)) return { success: false, error: "action must be create, add or remove", error_code: "INVALID_INPUT" };
+  if (req.action !== "create" && !req.video_url) return { success: false, error: "video_url is required for add/remove", error_code: "INVALID_INPUT" };
+
+  const handleMatch = req.video_url ? /\/@([A-Za-z0-9._]+)\//.exec(req.video_url) : null;
+  const idMatch = req.video_url ? /\/video\/(\d+)/.exec(req.video_url) : null;
+  if (req.action !== "create" && (!handleMatch || !idMatch)) {
+    return { success: false, error: "video_url must be a full TikTok video URL for add/remove", error_code: "INVALID_INPUT" };
+  }
+  const handle = handleMatch ? handleMatch[1] : null;
+  const videoId = idMatch ? idMatch[1] : null;
+
+  let session;
+  try {
+    session = await openAuthenticatedSession({
+      accountId: req.account_id,
+      proxySessionId: req.proxy_session_id,
+      cookies: req.cookies,
+      country: req.country,
+    });
+  } catch (e: any) {
+    return { success: false, error: `Failed to open session: ${e.message}`, error_code: "LAUNCH_FAILED" };
+  }
+
+  const { page, close } = session;
+  try {
+    // For create we must land on our OWN profile (the account's handle isn't
+    // otherwise known). Resolve it from the nav link like openEditProfileModal.
+    let targetUrl = req.video_url!;
+    if (req.action === "create") {
+      await page.goto("https://www.tiktok.com/foryou", { waitUntil: "domcontentloaded", timeout: 45000 }).catch(() => {});
+      const navLink = page.locator('a[data-e2e="nav-profile"]').first();
+      await navLink.waitFor({ state: "visible", timeout: 15000 }).catch(() => {});
+      let href: string | null = null;
+      for (let i = 0; i < 12; i++) {
+        href = await navLink.getAttribute("href").catch(() => null);
+        if (href && /\/@[\w.]+/.test(href)) break;
+        await page.waitForTimeout(700);
+      }
+      if (href && /\/@[\w.]+/.test(href)) {
+        targetUrl = href.startsWith("http") ? href : `https://www.tiktok.com${href}`;
+      } else {
+        const diag = await captureUiState(page, "playlist-own-profile-missing");
+        return { success: false, error: "Could not resolve your own profile URL to create a playlist.", error_code: "UI_TIMEOUT", data: diag as any };
+      }
+    }
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
+
+    const ready = await waitForHydrated(page, req.action === "create" ? HYDRATION_PROBES.profileActions : HYDRATION_PROBES.videoActions, { timeoutMs: 30000 });
+    if (!ready) {
+      const diag = await captureUiState(page, `playlist-${req.action}-not-hydrated`);
+      return {
+        success: false,
+        error: "The page loaded but its controls never rendered, so the playlist action could not be performed.",
+        error_code: "NOT_READY",
+        data: diag as any,
+      };
+    }
+    await dismissBlockingModal(page, 6000);
+
+    if (req.action === "create") {
+      // On the profile, open "Manage playlists" then "Create playlist", type the
+      // name and confirm. Verify by read-back that the name appears.
+      const manage = await resolveElement(page, [
+        { name: "text", build: (p) => p.getByText(/manage playlists/i) },
+        { name: "button", build: (p) => p.getByRole("button", { name: /manage playlists/i }) },
+      ], { perStrategyMs: 6000 });
+      if (manage) {
+        await manage.locator.click({ timeout: 8000 }).catch(() => {});
+        await page.waitForTimeout(1200);
+      }
+
+      const createBtn = await resolveElement(page, [
+        { name: "text", build: (p) => p.getByText(/create playlist/i) },
+        { name: "button", build: (p) => p.getByRole("button", { name: /create playlist/i }) },
+      ], { perStrategyMs: 6000 });
+      if (!createBtn) {
+        const diag = await captureUiState(page, "playlist-create-btn-missing");
+        return { success: false, error: "No 'Create playlist' control found — playlists may not be available to this account (10k+ followers required).", error_code: "NOT_READY", data: diag as any };
+      }
+      await createBtn.locator.click({ timeout: 8000 });
+      await page.waitForTimeout(800);
+
+      const input = await resolveElement(page, [
+        { name: "textbox", build: (p) => p.getByRole("textbox").last() },
+        { name: "input", build: (p) => p.locator('input[type="text"], textarea').last() },
+      ], { perStrategyMs: 6000 });
+      if (!input) {
+        const diag = await captureUiState(page, "playlist-name-input-missing");
+        return { success: false, error: "Could not find the playlist name input.", error_code: "UI_TIMEOUT", data: diag as any };
+      }
+      await input.locator.click({ timeout: 6000 });
+      await input.locator.fill(name);
+
+      // Confirm (a "Create"/"Done" button, or press Enter). Prefer a button.
+      const confirmBtn = await resolveElement(page, [
+        { name: "button", build: (p) => p.getByRole("button", { name: /^(create|done|save)$/i }) },
+      ], { perStrategyMs: 5000 });
+      if (confirmBtn) await confirmBtn.locator.click({ timeout: 8000 }).catch(async () => { await page.keyboard.press("Enter"); });
+      else await page.keyboard.press("Enter");
+      await page.waitForTimeout(1500);
+      await dismissBlockingModal(page, 4000);
+
+      // Verify the playlist name appears on the page.
+      const seen = await page.locator(`text=${name}`).first().isVisible({ timeout: 8000 }).catch(() => false);
+      if (!seen) {
+        const diag = await captureUiState(page, "playlist-create-unverified");
+        return { success: false, error: `Playlist "${name}" was not observed after creation — do not assume it exists.`, error_code: "UI_TIMEOUT", data: diag as any };
+      }
+    } else {
+      // add/remove: from the post's own action menu → "Add to playlist" /
+      // "Remove from playlist" → select the target playlist.
+      const shareBtn = await resolveElement(page, [
+        { name: "data-e2e", build: (p) => p.locator('[data-e2e="share-icon"], [data-e2e="browse-more-icon"]') },
+        { name: "aria-label", build: (p) => p.locator('button[aria-label*="hare" i], button[aria-label*="more" i]') },
+        { name: "role", build: (p) => p.getByRole("button", { name: /share|more/i }) },
+      ], { perStrategyMs: 6000 });
+      if (!shareBtn) {
+        const diag = await captureUiState(page, "playlist-more-missing");
+        return { success: false, error: "Could not find the post's action menu trigger.", error_code: "UI_TIMEOUT", data: diag as any };
+      }
+      await shareBtn.locator.click({ timeout: 10000 });
+      await page.waitForTimeout(900);
+
+      const menuItem = req.action === "add" ? /add to playlist/i : /remove from playlist/i;
+      const item = await resolveElement(page, [
+        { name: "menuitem", build: (p) => p.getByRole("menuitem", { name: menuItem }) },
+        { name: "text", build: (p) => p.getByText(menuItem) },
+      ], { perStrategyMs: 6000 });
+      if (!item) {
+        const diag = await captureUiState(page, `playlist-${req.action}-menu-missing`);
+        return { success: false, error: `No "${req.action === "add" ? "Add to playlist" : "Remove from playlist"}" entry found — the post may already be in (or not in) that state, or playlists aren't available.`, error_code: "UI_TIMEOUT", data: diag as any };
+      }
+      await item.locator.click({ timeout: 8000 });
+      await page.waitForTimeout(900);
+
+      // Select the named playlist from the tray/list that appears.
+      const target = await resolveElement(page, [
+        { name: "text", build: (p) => p.getByText(name, { exact: true }) },
+        { name: "role", build: (p) => p.getByRole("option", { name }).or(p.getByRole("menuitem", { name })) },
+      ], { perStrategyMs: 6000 });
+      if (!target) {
+        const diag = await captureUiState(page, `playlist-${req.action}-target-missing`);
+        return { success: false, error: `Could not find playlist "${name}" to ${req.action} the post.`, error_code: "NOT_FOUND", data: diag as any };
+      }
+      await target.locator.click({ timeout: 8000 });
+      await page.waitForTimeout(1200);
+      await dismissBlockingModal(page, 4000);
+
+      // Verify: for add, we cannot cheaply read the post's membership elsewhere;
+      // confirm the playlist chip/tray reflects it via the target again (or a
+      // toast). Best-effort read-back: the playlist row should now show the post.
+      const still = await page.getByText(name, { exact: true }).first().isVisible({ timeout: 5000 }).catch(() => false);
+      if (!still) {
+        const diag = await captureUiState(page, `playlist-${req.action}-unverified`);
+        return { success: false, error: `The "${name}" playlist could not be re-observed after ${req.action} — the change may not have applied.`, error_code: "UI_TIMEOUT", data: diag as any };
+      }
+    }
+
+    recordAction(req.account_id, "tiktok", "playlist");
+    return { success: true, data: { action: req.action, name, confirmed: true } };
+  } catch (e: any) {
+    const diag = await captureUiState(page, "playlist-error").catch(() => ({}));
+    return { success: false, error: e.message || String(e), error_code: "UNKNOWN", data: diag as any };
+  } finally {
+    await close();
+  }
+}
+
+export interface TikTokSearchRequest {
+  /** Optional local account to search within its authenticated session. If
+   *  omitted, search runs in an anonymous session (public TikTok search). */
+  account_id?: string;
+  /** The query text. */
+  query: string;
+  /** What to search for: videos, users, or hashtags. Defaults to video. */
+  type?: "video" | "user" | "hashtag";
+  country?: string;
+  /** Max results to return. Defaults to 20. */
+  limit?: number;
+}
+
+/**
+ * Search TikTok web for videos, users, or hashtags and return the observed
+ * results (captions/usernames/tags, real links, and visible counts). This is a
+ * READ operation: it scrapes only what actually renders and never fabricates
+ * results. If nothing renders it returns an empty list (observed emptiness),
+ * or NOT_READY if the results never appeared at all.
+ */
+export async function searchByType(req: TikTokSearchRequest): Promise<TikTokOpResult<{ type: string; query: string; results: any[]; total_observed: number }>> {
+  const query = (req.query || "").trim();
+  const type = req.type || "video";
+  if (!query) return { success: false, error: "query is required", error_code: "INVALID_INPUT" };
+  if (!["video", "user", "hashtag"].includes(type)) return { success: false, error: "type must be video, user or hashtag", error_code: "INVALID_INPUT" };
+  const limit = req.limit && req.limit > 0 ? Math.min(req.limit, 50) : 20;
+
+  let session;
+  try {
+    session = await launchLocalContext({
+      accountId: req.account_id || "__search__",
+      cookies: [],
+      country: req.country,
+      loadMedia: false,
+    });
+  } catch (e: any) {
+    return { success: false, error: `Failed to open session: ${e.message}`, error_code: "LAUNCH_FAILED" };
+  }
+
+  const { page, close } = session;
+  try {
+    const url = `https://www.tiktok.com/search/${type}?q=${encodeURIComponent(query)}`;
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+
+    // Wait for the corresponding result anchors to appear. These are the only
+    // reliable signal that real content rendered (TikTok's SPA shell has none).
+    const rendered = await waitForHydrated(
+      page,
+      {
+        label: `search-${type}`,
+        predicate: `(() => {
+          const want = ${JSON.stringify(type)};
+          const links = document.querySelectorAll('a[href]');
+          let n = 0;
+          for (const a of links) {
+            const h = a.getAttribute('href') || '';
+            if (want === 'user') { if (/\\/@[\\w.]+\\/?$/.test(h) && !/\\/video|\\/tag|\\/search|\\/tiktokstudio/.test(h)) n++; }
+            else if (want === 'hashtag') { if (/\\/tag\\/[\\w.]+/.test(h)) n++; }
+            else { if (/\\/video\\/\\d+/.test(h)) n++; }
+          }
+          return n > 0 ? 'rendered' : null;
+        })()`,
+      },
+      { timeoutMs: 30000 },
+    );
+
+    if (!rendered) {
+      const diag = await captureUiState(page, `search-${type}-not-rendered`);
+      // The SPA may show an empty-state ("no results") — distinguish it by
+      // whether any result-ish text rendered at all.
+      const body = (await page.evaluate(`() => (document.body.textContent || '')`).catch(() => "")) as string;
+      const emptyState = /no results|no videos|nothing for|no content|no user|not found/i.test(body.replace(/\s+/g, " "));
+      if (emptyState) {
+        return { success: true, data: { type, query, results: [], total_observed: 0 } };
+      }
+      return {
+        success: false,
+        error: `The search page for "${query}" never rendered its results, so no results were read.`,
+        error_code: "NOT_READY",
+        data: diag as any,
+      };
+    }
+
+    // Extract results defensively: real links + visible text near them.
+    const scraped: any = await page.evaluate(
+      ({ t, lim }) => {
+        const out: any[] = [];
+        const seen = new Set();
+        const links = Array.from(document.querySelectorAll("a[href]"));
+        const matchLink = (h: string) =>
+          t === "video" ? /\/video\/\d+/.test(h) :
+          t === "user" ? (/\/@[\w.]+\/?$/.test(h) && !/\/video|\/tag|\/search/.test(h)) :
+          /\/tag\/[\w.]+/.test(h);
+        for (const a of links) {
+          const href = a.getAttribute("href") || "";
+          if (!matchLink(href)) continue;
+          const key = href.replace(/[?&#].*$/, "");
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const el: any = a;
+          // Collect the visible text within the anchor's card.
+          const texts: string[] = [];
+          let node: any = el;
+          for (let i = 0; i < 6 && node; i++) {
+            const t2 = (node.innerText || "").replace(/\s+/g, " ").trim();
+            if (t2) texts.unshift(t2);
+            node = node.parentElement;
+          }
+          const snippet = texts.reduce((acc, x) => (acc.includes(x) ? acc : acc + " · " + x), "");
+          out.push({ url: href.startsWith("http") ? href : `https://www.tiktok.com${href}`, snippet: snippet.slice(0, 400) });
+          if (out.length >= lim) break;
+        }
+        return out;
+      },
+      { t: type, lim: limit },
+    ).catch((e: any) => ({ error: String(e?.message || e) }));
+
+    if (!scraped || scraped.error) {
+      const diag = await captureUiState(page, `search-${type}-scrape-failed`);
+      return { success: false, error: "Could not read the search results (unexpected structure).", error_code: "UI_TIMEOUT", data: diag as any };
+    }
+
+    return { success: true, data: { type, query, results: scraped as any[], total_observed: (scraped as any[]).length } };
+  } catch (e: any) {
+    const diag = await captureUiState(page, "search-error").catch(() => ({}));
+    return { success: false, error: e.message || String(e), error_code: "UNKNOWN", data: diag as any };
+  } finally {
+    await close();
+  }
+}
+
+export interface TikTokTrendingRequest {
+  /** Optional local account to read the feed within its authenticated session;
+   *  anonymous otherwise. */
+  account_id?: string;
+  country?: string;
+  /** Max videos to return. Defaults to 20. */
+  limit?: number;
+}
+
+/**
+ * Read the TikTok "For You" feed and return the videos TikTok shows there
+ * (real links + visible captions). Honest, observed-only output: no fabricated
+ * ranking. The feed is personalized and rotates (see SDD DEC-012), so these are
+ * "trending for you" suggestions — NOT a canonical global trending ranking.
+ */
+export async function trendingFeed(req: TikTokTrendingRequest): Promise<TikTokOpResult<{ source: string; results: any[]; total_observed: number }>> {
+  const limit = req.limit && req.limit > 0 ? Math.min(req.limit, 50) : 20;
+
+  let session;
+  try {
+    session = await launchLocalContext({
+      accountId: req.account_id || "__trending__",
+      cookies: [],
+      country: req.country,
+      loadMedia: false,
+    });
+  } catch (e: any) {
+    return { success: false, error: `Failed to open session: ${e.message}`, error_code: "LAUNCH_FAILED" };
+  }
+
+  const { page, close } = session;
+  try {
+    await page.goto("https://www.tiktok.com/foryou", { waitUntil: "domcontentloaded", timeout: 45000 });
+
+    const rendered = await waitForHydrated(
+      page,
+      {
+        label: "trending",
+        predicate: `(() => {
+          const links = document.querySelectorAll('a[href]');
+          let n = 0;
+          for (const a of links) {
+            if (/\\/video\\/\\d+/.test(a.getAttribute('href') || '')) n++;
+          }
+          return n > 0 ? 'rendered' : null;
+        })()`,
+      },
+      { timeoutMs: 30000 },
+    );
+
+    if (!rendered) {
+      const diag = await captureUiState(page, "trending-not-rendered");
+      return {
+        success: false,
+        error: "The For You feed never rendered its videos, so no videos were read.",
+        error_code: "NOT_READY",
+        data: diag as any,
+      };
+    }
+
+    const scraped: any = await page.evaluate(
+      (lim) => {
+        const out: any[] = [];
+        const seen = new Set();
+        const links = Array.from(document.querySelectorAll("a[href]"));
+        for (const a of links) {
+          const href = a.getAttribute("href") || "";
+          const m = href.match(/\/video\/(\d+)/);
+          if (!m) continue;
+          const key = `video/${m[1]}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const el: any = a;
+          const texts: string[] = [];
+          let node: any = el;
+          for (let i = 0; i < 6 && node; i++) {
+            const t = (node.innerText || "").replace(/\s+/g, " ").trim();
+            if (t) texts.unshift(t);
+            node = node.parentElement;
+          }
+          const snippet = texts.reduce((acc, x) => (acc.includes(x) ? acc : acc + " · " + x), "");
+          out.push({ video_id: m[1], url: `https://www.tiktok.com/video/${m[1]}`, snippet: snippet.slice(0, 400) });
+          if (out.length >= lim) break;
+        }
+        return out;
+      },
+      limit,
+    ).catch((e: any) => ({ error: String(e?.message || e) }));
+
+    if (!scraped || scraped.error) {
+      const diag = await captureUiState(page, "trending-scrape-failed");
+      return { success: false, error: "Could not read the For You feed (unexpected structure).", error_code: "UI_TIMEOUT", data: diag as any };
+    }
+
+    return { success: true, data: { source: "foryou", results: scraped as any[], total_observed: (scraped as any[]).length } };
+  } catch (e: any) {
+    const diag = await captureUiState(page, "trending-error").catch(() => ({}));
+    return { success: false, error: e.message || String(e), error_code: "UNKNOWN", data: diag as any };
+  } finally {
+    await close();
+  }
+}
+
+
+

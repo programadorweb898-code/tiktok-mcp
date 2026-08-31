@@ -1,10 +1,16 @@
 import { randomUUID } from "node:crypto";
 import {
   analyzePosts,
+  commentReply,
   deleteVideo,
   followUser,
   likeVideo,
+  monetizationStatus,
+  pinVideo,
+  playlistManage,
   postVideo,
+  searchByType,
+  trendingFeed,
   updateAvatar,
   updateProfile,
   type TikTokOpRequest,
@@ -13,6 +19,9 @@ import {
 import { checkCaption, hookReport } from "./tiktok-hooks.js";
 import { NICHES } from "./tiktok-niches.js";
 import { growthSince, latestForAccount, seriesFor } from "./tiktok-metrics.js";
+import { mixMedia, type MixMediaRequest } from "./media-mix.js";
+import { makeQuizVideo, type MakeQuizRequest } from "./media-quiz.js";
+import { makeDuetVideo, type MakeDuetRequest } from "./media-duet.js";
 import { launchLocalContext } from "./social-runtime.js";
 import { LOCATION_GUIDANCE, QrRelayClient, type QrRelaySession } from "./qr-relay.js";
 import {
@@ -249,6 +258,53 @@ export class LocalTikTokRuntime {
     return this.start("post", input.account_id, input, (common) => postVideo({ ...common, ...input } as any));
   }
 
+  /**
+   * Merge a separate audio track into a video using the bundled ffmpeg binary.
+   * Pure local media processing (no browser, no TikTok): returns the mixed MP4
+   * path so the agent can feed it to tiktok_post (via video_path) afterwards.
+   */
+  async mix(input: MixMediaRequest) {
+    const result = await mixMedia(input);
+    return {
+      output_path: result.filePath,
+      ffmpeg: result.ffmpeg,
+      audio_track: result.audio_track,
+      note: "Feed output_path to tiktok_post as video_path to publish.",
+    };
+  }
+
+  /**
+   * Burn a question + answer options onto a video as on-screen text and return
+   * the rendered MP4. Pure local media processing (ffmpeg drawtext); the quiz
+   * video can then be published via tiktok_post (video_path).
+   */
+  async makeQuiz(input: MakeQuizRequest) {
+    const result = await makeQuizVideo(input);
+    return {
+      output_path: result.filePath,
+      ffmpeg: result.ffmpeg,
+      question: result.question,
+      options: result.options,
+      note: "Feed output_path to tiktok_post as video_path to publish.",
+    };
+  }
+
+  /**
+   * Compose a duet (split screen) or stitch (leading clip + your take) video
+   * locally with ffmpeg. Pure local media processing; result can be published
+   * via tiktok_post (video_path). TikTok's native Duet/Stitch editor is mobile
+   * only, so this builds the equivalent MP4 that desktop creators upload.
+   */
+  async makeDuet(input: MakeDuetRequest) {
+    const result = await makeDuetVideo(input);
+    return {
+      output_path: result.filePath,
+      ffmpeg: result.ffmpeg,
+      mode: result.mode,
+      note: "Feed output_path to tiktok_post as video_path to publish.",
+    };
+  }
+
   follow(input: { account_id: string; target_user: string }) {
     return this.start("follow", input.account_id, input, (common) => followUser({ ...common, ...input }));
   }
@@ -271,6 +327,39 @@ export class LocalTikTokRuntime {
 
   analytics(input: { account_id: string }) {
     return this.start("analytics", input.account_id, input, (common) => analyzePosts(common));
+  }
+
+  /**
+   * Read the account's monetization status from TikTok Studio web. This is a
+   * read-only browser query; enrolling in a monetization program requires
+   * eligibility (e.g. 10k+ followers) which this op does not enforce or fake.
+   */
+  monetization(input: { account_id: string }) {
+    return this.start("monetization", input.account_id, input, (common) => monetizationStatus(common));
+  }
+
+  /**
+   * Reply to a comment in TikTok Studio's web Comment Management. A browser
+   * action; verifies the posted reply by read-back before reporting success.
+   */
+  commentReply(input: { account_id: string; comment_text: string; reply: string }) {
+    return this.start("comment", input.account_id, input, (common) => commentReply({ ...common, ...input }));
+  }
+
+  /**
+   * Pin (or unpin) one of the account's own videos to the top of its profile,
+   * verified by reading the profile back for the "Pinned" badge.
+   */
+  pinVideo(input: { account_id: string; video_url: string; action: "pin" | "unpin" }) {
+    return this.start("pin", input.account_id, input, (common) => pinVideo({ ...common, ...input }));
+  }
+
+  /**
+   * Create a playlist, or add/remove a public post from one, on the profile
+   * web. Playlists require 10k+ followers; verified by read-back.
+   */
+  playlistManage(input: { account_id: string; action: "create" | "add" | "remove"; name: string; video_url?: string }) {
+    return this.start("playlist", input.account_id, input, (common) => playlistManage({ ...common, ...input }));
   }
 
   series(input: { account_id: string; video_id?: string; hours?: number }) {
@@ -300,6 +389,16 @@ export class LocalTikTokRuntime {
 
   niches() {
     return { count: NICHES.length, niches: NICHES.map(({ id, label, aliases }) => ({ id, label, aliases })) };
+  }
+
+  search(input: { account_id?: string; query: string; type?: "video" | "user" | "hashtag"; country?: string; limit?: number }) {
+    if (input.account_id) this.common(input.account_id);
+    return searchByType(input);
+  }
+
+  trending(input: { account_id?: string; country?: string; limit?: number }) {
+    if (input.account_id) this.common(input.account_id);
+    return trendingFeed(input);
   }
 
   scheduled(input: { account_id?: string; include_done?: boolean }) {
