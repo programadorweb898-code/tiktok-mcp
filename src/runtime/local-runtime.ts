@@ -3,6 +3,7 @@ import {
   analyzePosts,
   commentOnVideo,
   commentReply,
+  deleteComment,
   deleteVideo,
   followUser,
   likeVideo,
@@ -364,6 +365,14 @@ export class LocalTikTokRuntime {
    */
   comment(input: { account_id: string; video_url: string; comment: string }) {
     return this.start("comment", input.account_id, input, (common) => commentOnVideo({ ...common, ...input }));
+  }
+
+  /**
+   * Delete a comment on the account's videos from TikTok Studio's Comment
+   * Management. A browser action; verifies the comment's removal by read-back.
+   */
+  deleteComment(input: { account_id: string; comment_text: string }) {
+    return this.start("comment", input.account_id, input, (common) => deleteComment({ ...common, ...input }));
   }
 
   /**

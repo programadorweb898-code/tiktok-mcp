@@ -2681,6 +2681,167 @@ export async function listComments(req: TikTokListCommentsRequest): Promise<TikT
   }
 }
 
+export interface TikTokDeleteCommentRequest extends TikTokOpRequest {
+  /** Substring of the comment's text to locate the specific comment (case-insensitive). */
+  comment_text: string;
+}
+
+/**
+ * Delete a comment from the account's videos in TikTok Studio's web Comment
+ * Management (`/tiktokstudio/comment-management`). Locates the comment row by
+ * its text (same 3-tier resolution as commentReply), opens its "..." menu,
+ * picks Delete, confirms the dialog if shown, and verifies by read-back that
+ * the comment's text is gone from the page.
+ *
+ * LIMITATION: like comment-reply/list-comments, the exact comment-management
+ * DOM could not be captured in this development environment (it needs a session
+ * with comments). Uses resilient multi-tier selectors and never reports success
+ * without observing the comment's removal. Must be validated manually against a
+ * real account with comments.
+ */
+export async function deleteComment(req: TikTokDeleteCommentRequest): Promise<TikTokOpResult<{ deleted: boolean; target: string }>> {
+  const blocked = gate(req.account_id, "comment");
+  if (blocked) return blocked;
+
+  const commentText = (req.comment_text || "").trim();
+  if (!commentText) {
+    return { success: false, error: "comment_text is required to locate the comment to delete", error_code: "INVALID_INPUT" };
+  }
+
+  let session;
+  try {
+    session = await openAuthenticatedSession({
+      accountId: req.account_id,
+      proxySessionId: req.proxy_session_id,
+      cookies: req.cookies,
+      country: req.country,
+    });
+  } catch (e: any) {
+    return { success: false, error: `Failed to open session: ${e.message}`, error_code: "LAUNCH_FAILED" };
+  }
+
+  const { page, close } = session;
+  try {
+    await warmStudioSession(page);
+    await page.goto("https://www.tiktok.com/tiktokstudio/comment-management", { waitUntil: "domcontentloaded", timeout: 45000 });
+
+    const rendered = await waitForHydrated(
+      page,
+      {
+        label: "comment-management-delete",
+        predicate: `(() => {
+          const t = (document.body.textContent || '').toLowerCase();
+          const hasWord = /comments|comment|reply|respond/.test(t) ? 1 : 0;
+          const hasAnyNode = document.querySelectorAll('input, textarea, [contenteditable="true"], button').length;
+          return (hasWord + hasAnyNode) >= 2 ? 'rendered' : null;
+        })()`,
+      },
+      { timeoutMs: STUDIO_HYDRATION_TIMEOUT_MS },
+    );
+    if (!rendered) {
+      const diag = await captureUiState(page, "comment-delete-not-hydrated");
+      return {
+        success: false,
+        error: "The comment-management page never finished rendering, so the comment could not be located.",
+        error_code: "NOT_READY",
+        data: diag as any,
+      };
+    }
+    await page.waitForTimeout(1500);
+    await dismissBlockingModal(page);
+
+    // Locate the comment row by its text — same 3-tier resolution as reply.
+    const targetSelector = commentText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const row = await resolveElement(page, [
+      {
+        name: "text-substring",
+        build: (p) => p.locator(`//div[contains(., "${commentText}")]`).last(),
+      },
+      {
+        name: "aria-comment",
+        build: (p) => p.getByRole("listitem").filter({ hasText: new RegExp(targetSelector, "i") }).first(),
+      },
+      {
+        name: "structural-comment",
+        build: (p) => p.locator(`div:has-text("${commentText}")`).last(),
+      },
+    ], { perStrategyMs: 6000, state: "attached" });
+    if (!row) {
+      const diag = await captureUiState(page, "comment-delete-target-not-found");
+      return {
+        success: false,
+        error: `No comment matching "${req.comment_text}" was found in Comment Management. It may already be deleted.`,
+        error_code: "NOT_FOUND",
+        data: diag as any,
+      };
+    }
+
+    // Open the row's "..." more-menu (the last icon-only button in the row) and
+    // choose Delete.
+    const moreBtn = row.locator.locator('button:last-of-type, [role="button"]:last-of-type').first();
+    let deleteItem: any = null;
+    if ((await moreBtn.count().catch(() => 0)) > 0 && await moreBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+      await moreBtn.click({ timeout: 6000 }).catch(() => {});
+      await page.waitForTimeout(800);
+      deleteItem = await resolveElement(page, [
+        { name: "menuitem", build: (p) => p.getByRole("menuitem", { name: /^delete$/i }) },
+        { name: "text", build: (p) => p.getByText(/^delete$/i) },
+      ], { perStrategyMs: 5000 });
+    }
+
+    if (!deleteItem) {
+      // No "..." menu (or no Delete entry in it) — report missing, don't guess.
+      const diag = await captureUiState(page, "comment-delete-menu-missing");
+      return {
+        success: false,
+        error: "Could not find the Delete action in the comment's menu (selector may have rotated, or this comment type has no delete affordance).",
+        error_code: "UI_TIMEOUT",
+        data: diag as any,
+      };
+    }
+    await deleteItem.locator.click({ timeout: 5000 });
+    await page.waitForTimeout(600);
+
+    // TikTok may show a confirm dialog ("Delete comment?") — click its Delete
+    // button if present (scoped to :visible so the hidden menu item is excluded).
+    const confirmBtn = page.locator('button:has-text("Delete"):visible, [role="button"]:has-text("Delete"):visible').last();
+    if ((await confirmBtn.count().catch(() => 0)) > 0) {
+      await confirmBtn.click({ timeout: 6000 }).catch(() => {});
+    }
+
+    // VERIFY by read-back: the comment's text must disappear from the page.
+    const gone = await page
+      .waitForFunction(
+        (needle: string) => {
+          const t = (document.body.textContent || "");
+          return !t.replace(/\s+/g, " ").toLowerCase().includes(needle.toLowerCase());
+        },
+        commentText,
+        { timeout: 12000 },
+      )
+      .then(() => true)
+      .catch(() => false);
+
+    if (!gone) {
+      const diag = await captureUiState(page, "comment-delete-unverified");
+      return {
+        success: false,
+        error: "The delete action was submitted but the comment still appears on screen — do not re-run blindly (it may have partially applied).",
+        error_code: "UI_TIMEOUT",
+        data: diag as any,
+      };
+    }
+
+    recordAction(req.account_id, "tiktok", "comment");
+    return { success: true, data: { deleted: true, target: commentText } };
+  } catch (e: any) {
+    const diag = await captureUiState(page, "comment-delete-error").catch(() => ({}));
+    return { success: false, error: e.message || String(e), error_code: "UNKNOWN", data: diag as any };
+  } finally {
+    await close();
+  }
+}
+
 export interface TikTokPlaylistRequest extends TikTokOpRequest {
   /** What to do: create a playlist, or add/remove a public post. */
   action: "create" | "add" | "remove";

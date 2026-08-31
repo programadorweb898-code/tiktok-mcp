@@ -221,6 +221,15 @@ export function createTikTokServer(options: TikTokServerOptions = {}): McpServer
     },
   }, (args) => runtime.commentReply(args as any));
 
+  addTool(server, "tiktok_delete_comment", {
+    title: "Delete a comment",
+    description: "Delete a comment on the account's videos in TikTok Studio's Comment Management. Locates the comment by its text, opens its menu, selects Delete, confirms if prompted, and verifies the comment is gone by read-back.",
+    inputSchema: {
+      account_id: ACCOUNT_ID,
+      comment_text: z.string().min(1).describe("Substring of the comment to delete"),
+    },
+  }, (args) => runtime.deleteComment(args as any));
+
   addTool(server, "tiktok_pin_video", {
     title: "Pin or unpin a video on the profile",
     description: "Pin (or unpin) one of your own videos to the top of your TikTok profile via the video's action menu. Verified by reading the profile back for the 'Pinned' badge.",

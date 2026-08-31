@@ -40,6 +40,7 @@ You can connect unlimited number of accounts. The agent will keep all TikTok ses
 | `tiktok_unlike`           | Remove the like from a video              |
 | `tiktok_comment`          | Comment on another user's video           |
 | `tiktok_comments`         | List comments on the account's videos     |
+| `tiktok_delete_comment`   | Delete a comment in Comment Management    |
 | `tiktok_delete`           | Delete a video                            |
 | `tiktok_update_profile`   | Update a display name or bio              |
 | `tiktok_update_avatar`    | Update a profile image                    |
