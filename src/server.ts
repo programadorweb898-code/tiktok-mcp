@@ -338,6 +338,18 @@ export function createTikTokServer(options: TikTokServerOptions = {}): McpServer
     inputSchema: { account_id: ACCOUNT_ID },
   }, (args) => runtime.analytics(args as any));
 
+  addTool(server, "tiktok_profile_analytics", {
+    title: "Read profile analytics (followers, likes, videos totals)",
+    description: "Read the account's own public profile header — display name, @handle, bio and total counters (Following / Followers / Likes / Videos). Reaches the profile via the left-nav link, so no handle is needed. Read-only; reports NOT_READY if the header never renders.",
+    inputSchema: { account_id: ACCOUNT_ID },
+  }, (args) => runtime.profileAnalytics(args as any));
+
+  addTool(server, "tiktok_studio_analytics", {
+    title: "Read TikTok Studio analytics overview",
+    description: "Read TikTok Studio's analytics overview in a defensive best-effort way, extracting visible label/value pairs (Views, Watch time, Followers, Likes, Comments, etc.). Never guesses a metric that isn't visibly present; reports NOT_READY if nothing renders.",
+    inputSchema: { account_id: ACCOUNT_ID },
+  }, (args) => runtime.studioAnalytics(args as any));
+
   addTool(server, "tiktok_monetization_status", {
     title: "Read TikTok monetization status",
     description: "Read the account's monetization status/performance from TikTok Studio web. Enrollment in a monetization program requires strict eligibility (10k+ followers, 100k views/30d, account 30+ days, 18+); this only reads the status page and never fakes eligibility.",

@@ -1480,6 +1480,33 @@ export async function deleteVideo(req: TikTokDeleteRequest): Promise<TikTokOpRes
 }
 
 /**
+ * Resolve the logged-in user's own profile URL from the left-nav profile link —
+ * no username needed. Returns the absolute `https://www.tiktok.com/@<handle>`
+ * URL, or null if it can't be resolved. Used to reach one's own public profile
+ * (analytics) without requiring the caller to know the handle.
+ */
+async function resolveOwnProfileUrl(page: any): Promise<string | null> {
+  if (/tiktok\.com\/@[\w.]/.test(String(page.url()))) return page.url();
+  await page.goto("https://www.tiktok.com/foryou", { waitUntil: "domcontentloaded", timeout: 45000 }).catch(() => {});
+  const navLink = page.locator('a[data-e2e="nav-profile"]').first();
+  // waitFor (not isVisible) so we poll until the SPA nav hydrates.
+  await navLink.waitFor({ state: "visible", timeout: 15000 }).catch(() => {});
+  // The href hydrates from a bare "/@" placeholder to "/@<username>" a beat
+  // after the link appears — poll until a real username is present, else the
+  // direct navigation 404s.
+  let href: string | null = null;
+  for (let i = 0; i < 12; i++) {
+    href = await navLink.getAttribute("href").catch(() => null);
+    if (href && /\/@[\w.]+/.test(href)) break;
+    await page.waitForTimeout(700);
+  }
+  if (href && /\/@[\w.]+/.test(href)) {
+    return href.startsWith("http") ? href : `https://www.tiktok.com${href}`;
+  }
+  return null;
+}
+
+/**
  * Reach the logged-in user's own profile (via the left-nav profile link — no
  * username needed) and open the "Edit profile" modal. Bio, display name and
  * avatar all live behind this single modal (TikTok moved them off /setting).
@@ -1490,24 +1517,12 @@ async function openEditProfileModal(page: any): Promise<boolean> {
   // directly — more reliable than clicking, which the SPA can race or an
   // overlay can intercept.
   if (!/tiktok\.com\/@[\w.]/.test(String(page.url()))) {
-    await page.goto("https://www.tiktok.com/foryou", { waitUntil: "domcontentloaded", timeout: 45000 }).catch(() => {});
-    const navLink = page.locator('a[data-e2e="nav-profile"]').first();
-    // waitFor (not isVisible) so we poll until the SPA nav hydrates.
-    await navLink.waitFor({ state: "visible", timeout: 15000 }).catch(() => {});
-    // The href hydrates from a bare "/@" placeholder to "/@<username>" a beat
-    // after the link appears — poll until a real username is present, else the
-    // direct navigation 404s.
-    let href: string | null = null;
-    for (let i = 0; i < 12; i++) {
-      href = await navLink.getAttribute("href").catch(() => null);
-      if (href && /\/@[\w.]+/.test(href)) break;
-      await page.waitForTimeout(700);
-    }
-    if (href && /\/@[\w.]+/.test(href)) {
-      const url = href.startsWith("http") ? href : `https://www.tiktok.com${href}`;
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 }).catch(() => {});
+    const ownUrl = await resolveOwnProfileUrl(page);
+    if (ownUrl) {
+      await page.goto(ownUrl, { waitUntil: "domcontentloaded", timeout: 45000 }).catch(() => {});
     } else {
       // Fallback: let the SPA navigate (it knows the username internally).
+      const navLink = page.locator('a[data-e2e="nav-profile"]').first();
       await navLink.click().catch(() => {});
       await page.waitForTimeout(2000);
     }
@@ -1938,6 +1953,200 @@ export async function analyzePosts(req: TikTokAnalyticsRequest): Promise<TikTokO
 }
 
 export interface TikTokMonetizationRequest extends TikTokOpRequest {}
+
+export interface TikTokProfileAnalyticsRequest extends TikTokOpRequest {}
+
+/**
+ * Read the account's own public profile header: display name, @handle, bio and
+ * the total counters (Following / Followers / Likes / Videos). Reaches the
+ * profile via `resolveOwnProfileUrl` (the left-nav link), so no handle is
+ * needed from the caller. The profile header could not be captured in this
+ * development environment, so this scraping is deliberately defensive and
+ * keyed off observable structure (title attributes + surrounding text), never
+ * hard-coded fragile class names. If the header never renders, reports
+ * NOT_READY rather than fabricating totals.
+ */
+export async function profileAnalyticsFeed(req: TikTokProfileAnalyticsRequest): Promise<TikTokOpResult<{ profile: any; scraped_at: string }>> {
+  let session;
+  try {
+    session = await openAuthenticatedSession({
+      accountId: req.account_id,
+      proxySessionId: req.proxy_session_id,
+      cookies: req.cookies,
+      country: req.country,
+    });
+  } catch (e: any) {
+    return { success: false, error: `Failed to open session: ${e.message}`, error_code: "LAUNCH_FAILED" };
+  }
+
+  const { page, close } = session;
+  try {
+    const ownUrl = await resolveOwnProfileUrl(page);
+    if (!ownUrl) {
+      const diag = await captureUiState(page, "profile-analytics-no-nav");
+      return { success: false, error: "Could not resolve the account's own profile URL from the nav.", error_code: "NOT_READY", data: diag as any };
+    }
+    await page.goto(ownUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
+
+    const rendered = await waitForHydrated(
+      page,
+      {
+        label: "profile-header",
+        predicate: `(() => {
+          const strong = [...document.querySelectorAll('strong[title]')];
+          return strong.length > 0 ? 'rendered' : null;
+        })()`,
+      },
+      { timeoutMs: 30000 },
+    );
+    if (!rendered) {
+      const diag = await captureUiState(page, "profile-analytics-not-rendered");
+      return {
+        success: false,
+        error: "The profile header never rendered its total counters, so no profile analytics were read.",
+        error_code: "NOT_READY",
+        data: diag as any,
+      };
+    }
+
+    const profile: any = await page.evaluate(`(() => {
+      const parseNum = (t) => {
+        if (t == null) return null;
+        const m = String(t).trim().replace(/,/g, '').match(/^([\\d.]+)\\s*([KMB])?$/i);
+        if (!m) return null;
+        let n = parseFloat(m[1]); const u = (m[2] || '').toUpperCase();
+        if (u === 'K') n *= 1e3; else if (u === 'M') n *= 1e6; else if (u === 'B') n *= 1e9;
+        return Math.round(n);
+      };
+      const data = { handle: '', display_name: '', bio: '', counts: {} };
+      const handleEl = document.querySelector('h1[data-e2e="user-title"], [data-e2e="user-title"], h1');
+      if (handleEl) data.display_name = (handleEl.textContent || '').trim();
+      const atEl = document.querySelector('[data-e2e="user-subtitle"], h2');
+      if (atEl) data.handle = (atEl.textContent || '').trim();
+      const tot = {};
+      for (const s of document.querySelectorAll('strong[title]')) {
+        const title = (s.getAttribute('title') || '').trim();
+        const num = s.textContent || '';
+        const key = title.toLowerCase().includes('following') ? 'following'
+          : title.toLowerCase().includes('follower') ? 'followers'
+          : title.toLowerCase().includes('like') ? 'likes'
+          : title.toLowerCase().includes('video') ? 'videos'
+          : title.toLowerCase().includes('love') ? 'loves' : null;
+        if (key) tot[key] = parseNum(num);
+      }
+      data.counts = tot;
+      const bioEl = document.querySelector('[data-e2e="user-bio"], [data-e2e="user-bio"] p, div[data-e2e="user-info"]');
+      if (bioEl) data.bio = (bioEl.textContent || '').trim();
+      return data;
+    })()`).catch((e: any) => ({ error: String(e?.message || e) }));
+
+    if (!profile || profile.error) {
+      const diag = await captureUiState(page, "profile-analytics-scrape-failed");
+      return { success: false, error: "Could not read the profile header (unexpected structure).", error_code: "UI_TIMEOUT", data: diag as any };
+    }
+
+    return { success: true, data: { profile: profile as any, scraped_at: new Date().toISOString() } };
+  } catch (e: any) {
+    const diag = await captureUiState(page, "profile-analytics-error").catch(() => ({}));
+    return { success: false, error: e.message || String(e), error_code: "UNKNOWN", data: diag as any };
+  } finally {
+    await close();
+  }
+}
+
+export interface TikTokStudioAnalyticsRequest extends TikTokOpRequest {}
+
+/**
+ * Read TikTok Studio's analytics overview (`/tiktokstudio/analytics`) in a
+ * defensive, best-effort way: extracts visible label/value pairs from the
+ * cards and sections of the page, keyed off the text shown (e.g. "Views",
+ * "Watch time", "Followers", percentages). The Studio analytics DOM could not
+ * be captured in this development environment, so this never guesses a metric
+ * that isn't visibly present and reports NOT_READY if the page doesn't render.
+ */
+export async function studioAnalyticsFeed(req: TikTokStudioAnalyticsRequest): Promise<TikTokOpResult<{ metrics: any[]; scraped_at: string }>> {
+  let session;
+  try {
+    session = await openAuthenticatedSession({
+      accountId: req.account_id,
+      proxySessionId: req.proxy_session_id,
+      cookies: req.cookies,
+      country: req.country,
+    });
+  } catch (e: any) {
+    return { success: false, error: `Failed to open session: ${e.message}`, error_code: "LAUNCH_FAILED" };
+  }
+
+  const { page, close } = session;
+  try {
+    await warmStudioSession(page);
+    await page.goto("https://www.tiktok.com/tiktokstudio/analytics", { waitUntil: "domcontentloaded", timeout: 45000 });
+
+    const rendered = await waitForHydrated(
+      page,
+      {
+        label: "studio-analytics",
+        predicate: `(() => {
+          const t = (document.body ? document.body.textContent : '') || '';
+          return /(views|followers|watch time|watch time|likes|comments|shares|overview|vistas|seguidores)/i.test(t) ? 'rendered' : null;
+        })()`,
+      },
+      { timeoutMs: 30000 },
+    );
+    if (!rendered) {
+      const diag = await captureUiState(page, "studio-analytics-not-rendered");
+      return { success: false, error: "The Studio analytics page never rendered any metric content, so no analytics were read.", error_code: "NOT_READY", data: diag as any };
+    }
+
+    const metrics: any = await page.evaluate(`(() => {
+      const parseNum = (t) => {
+        if (t == null) return null;
+        const m = String(t).trim().replace(/,/g, '').match(/^([\\d.]+)\\s*([KMB%])?$/i);
+        if (!m) return null;
+        let n = parseFloat(m[1]); const u = (m[2] || '').toUpperCase();
+        if (u === 'K') n *= 1e3; else if (u === 'M') n *= 1e6; else if (u === 'B') n *= 1e9;
+        else if (u === '%') return m[1] + '%';
+        return Math.round(n);
+      };
+      const out = [];
+      const seen = new Set();
+      for (const s of document.querySelectorAll('strong, b, [class*="count" i], [class*="value" i]')) {
+        const num = (s.textContent || '').trim();
+        if (!/^[\\d.,]+[KMB%]?$/i.test(num)) continue;
+        const node = s;
+        let label = '';
+        const parts = [];
+        let el = node.parentElement;
+        for (let i = 0; i < 4 && el; i++) {
+          const t = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+          if (t) parts.unshift(t);
+          el = el.parentElement;
+        }
+        const joined = parts.join(' · ');
+        const key = joined;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const labelMatch = joined.match(/((?:Total\\s+)?(?:Views|Watch time|Followers|Likes|Comments|Shares|Videos|Engagement|Vistas|Seguidores))/i);
+        if (labelMatch) label = labelMatch[1];
+        out.push({ label: label || joined.slice(0, 120), value: parseNum(num), raw: joined.slice(0, 400) });
+        if (out.length >= 30) break;
+      }
+      return out;
+    })()`).catch((e: any) => ({ error: String(e?.message || e) }));
+
+    if (!metrics || metrics.error) {
+      const diag = await captureUiState(page, "studio-analytics-scrape-failed");
+      return { success: false, error: "Could not read the Studio analytics content (unexpected structure).", error_code: "UI_TIMEOUT", data: diag as any };
+    }
+
+    return { success: true, data: { metrics: metrics as any[], scraped_at: new Date().toISOString() } };
+  } catch (e: any) {
+    const diag = await captureUiState(page, "studio-analytics-error").catch(() => ({}));
+    return { success: false, error: e.message || String(e), error_code: "UNKNOWN", data: diag as any };
+  } finally {
+    await close();
+  }
+}
 
 /**
  * Read the account's monetization status from TikTok Studio's web monetization

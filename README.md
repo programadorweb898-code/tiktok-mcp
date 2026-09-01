@@ -48,6 +48,8 @@ You can connect unlimited number of accounts. The agent will keep all TikTok ses
 | `tiktok_update_profile`   | Update a display name or bio              |
 | `tiktok_update_avatar`    | Update a profile image                    |
 | `tiktok_analytics`        | Collect and save post metrics locally     |
+| `tiktok_profile_analytics`| Read profile totals (followers/likes/videos) |
+| `tiktok_studio_analytics` | Read TikTok Studio analytics overview     |
 | `tiktok_series`           | Read saved performance history and growth |
 | `tiktok_hooks`            | Analyze caption hooks from local history  |
 | `tiktok_niches`           | List suggested hook-analysis niches       |

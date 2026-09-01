@@ -12,8 +12,10 @@ import {
   pinVideo,
   playlistManage,
   postVideo,
+  profileAnalyticsFeed,
   searchByType,
   soundsFeed,
+  studioAnalyticsFeed,
   trendingCreatorsFeed,
   trendingFeed,
   trendingTopicsFeed,
@@ -343,6 +345,14 @@ export class LocalTikTokRuntime {
 
   analytics(input: { account_id: string }) {
     return this.start("analytics", input.account_id, input, (common) => analyzePosts(common));
+  }
+
+  profileAnalytics(input: { account_id: string }) {
+    return this.start("profileAnalytics", input.account_id, input, (common) => profileAnalyticsFeed(common));
+  }
+
+  studioAnalytics(input: { account_id: string }) {
+    return this.start("studioAnalytics", input.account_id, input, (common) => studioAnalyticsFeed(common));
   }
 
   /**
