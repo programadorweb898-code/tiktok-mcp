@@ -50,7 +50,7 @@ El sistema combina: MCP (stdio), Playwright con perfiles de navegador persistent
 ```
 Agente MCP (Claude Code, Codex, Hermes, …)
         ↓  stdio (JSON-RPC)
-src/server.ts            — definición y validación de las 35 tools MCP
+src/server.ts            — definición y validación de las 37 tools MCP
         ↓
 LocalTikTokRuntime       — src/runtime/local-runtime.ts
         ↓                (operaciones asíncronas + registro de jobs)
@@ -70,7 +70,7 @@ TikTok (web + TikTok Studio)
 | Archivo | Responsabilidad |
 |---|---|
 | `src/index.ts` | Entrypoint binario (`tiktok-mcp`). Flags: `--data-dir`, `--browser-path`, `--headless`. Transporte stdio. |
-| `src/server.ts` | Registro de las 35 tools con esquemas zod, wrapper `addTool` con captura de errores y devolución estructurada (`structuredContent` + texto JSON). |
+| `src/server.ts` | Registro de las 37 tools con esquemas zod, wrapper `addTool` con captura de errores y devolución estructurada (`structuredContent` + texto JSON). |
 | `src/runtime/local-runtime.ts` | Orquestador. Crea operaciones asíncronas (`pending → running → done/failed/cancelled`), gestiona el flujo de conexión QR, delega en las operaciones. |
 | `src/runtime/tiktok-operations.ts` | Implementación real de cada operación contra TikTok: subida de video, follow, like, delete, perfil, avatar, scraping de analíticas. Incluye helpers de diagnóstico, modales, privacidad, scheduling nativo e interceptor de respuestas API. |
 | `src/runtime/media-mix.ts` | Fusión local de media con `ffmpeg-static` (binario incluido): reemplaza o superpone una pista de audio sobre un video y produce un MP4 listo para `tiktok_post`. |
@@ -102,7 +102,7 @@ Solo puede haber **una sesión de navegador abierta por cuenta a la vez**: `lock
 
 ## 4. Capacidades actuales (tools MCP)
 
-Verificado contra `src/server.ts`. El servidor expone exactamente 35 tools (el test lo afirma).
+Verificado contra `src/server.ts`. El servidor expone exactamente 37 tools (el test lo afirma).
 
 | Tool | Propósito | Parámetros principales | Implementación | Browser/API | Estado | Limitaciones conocidas |
 |---|---|---|---|---|---|---|
@@ -223,12 +223,12 @@ Fase 3 del roadmap.
 
 | Capacidad | Estado |
 |---|---|
-| descubrir LIVE | RESEARCH |
-| información de LIVE | RESEARCH |
-| interacción en LIVE | RESEARCH |
-| comentarios en LIVE | RESEARCH |
+| descubrir LIVE | PARTIAL (v1) | `tiktok_live_discover` lee el feed LIVE público (`/live`) de forma anónima y defensiva, devolviendo las rooms que TikTok muestra con links reales a `/@<handle>/live` + snippet visible (título, viewers). Devuelve lista vacía si renderiza sin rooms; `NOT_READY` si no renderiza. DOM no inspeccionado en desarrollo → validación manual pendiente |
+| información de LIVE | PARTIAL (v1) | `tiktok_live_info` navega a `/@<handle>/live` (anónimo, read-only) y extrae lo observable: título, host/handle, viewers/likes cuando son visibles. No scrapea URLs de stream ni captura chat. Reporta offline/unknown honestamente. DOM no inspeccionado → validación manual pendiente |
+| interacción en LIVE | NOT_PLANNED (v1) | Enviar regalos/likes en vivo requiere sesión + superficie sensible no inspeccionada; se deja fuera de esta fase |
+| comentarios en LIVE | NOT_PLANNED (v1) | El chat en vivo es streaming y de alta complejidad; fuera de esta fase |
 
-Fase 5 del roadmap.
+Fase 5 del roadmap (parcial: descubrimiento e información).
 
 ---
 
@@ -339,7 +339,7 @@ Separación estricta entre datos observados de TikTok y cálculo local:
 Actual (`npm test` = build + `node --test dist/tests/*.test.js`, framework `node:test`):
 
 - Unitarios puros (sin navegador): validadores de input y mapeo de errores (`op-validators.test.ts` — `normalizeHandle`, `isValidHandle`, `isValidVideoPermalink`, `mapTikTokError`) y capa de estabilización de selectores (`social-selectors.test.ts` — `resolveElement` con fallback, `waitForHydrated` con timeout sin lanzar, `axSnapshot`). Estos tests detectaron y fijaron un bug real de `normalizeHandle`: el orden `replace(/^@/).trim()` dejaba un `@` inicial cuando había espacios antes del handle (p. ej. `"  @brand"`), ahora `trim()` primero y luego quita el `@` (DEC-021).
-- Unitarios/integración local: persistencia de cuentas y muestras de analíticas (recordSample dedup, series, latest), contrato de las 35 tools vía `InMemoryTransport` (nombres, ausencia de campos de pago, llamada a `tiktok_niches`), arranque real del binario empaquetado por stdio, contrato HTTP del cliente QR relay (con fetch inyectado). La fusión de media (`tiktok_mix_media`), el quiz visual (`tiktok_make_quiz`) y el duet/stitch (`tiktok_make_duet`) se validan con una ejecución manual real de `ffmpeg` sobre archivos de prueba; no hay test automatizado del binario. `tiktok_monetization_status` se implementó sin poder inspeccionar el DOM real (requiere cuenta apta autenticada): su validación final es manual. Igual para `tiktok_comment_reply`, que depende del DOM de Comment Management (requiere una cuenta con comentarios): validación final manual. `tiktok_pin_video`, que depende del menú de acciones del video, también requiere validación manual contra una cuenta real. `tiktok_playlist_manage` comparte la misma situación: solo está disponible para cuentas con 10k+ seguidores, así que su validación final es manual contra una cuenta apta. `tiktok_search` también se implementó sin inspeccionar el DOM de resultados en desarrollo (búsqueda pública): se lee por links reales + texto visible y su validación final es manual. `tiktok_comment` comparte la situación del watch page (DOM de comentarios no inspeccionado en desarrollo): selectores resilientes + read-back, validación final manual contra una cuenta real. `tiktok_like` y `tiktok_unlike`, al depender ambos del atributo `aria-pressed` del botón de like en el watch page (misma superficie no inspeccionada en desarrollo desde DEC-017), requieren validación manual: se debe confirmar que el like aparece realmente (y que un like repetido no hace unlike). `tiktok_unfollow`, al depender del estado textual del botón de follow en el perfil público y del posible diálogo de confirmación (superficie no inspeccionada en desarrollo), también requiere validación manual contra una cuenta con seguidores. `tiktok_delete_comment`, al depender del menú "…" de cada fila de comentario en Comment Management (superficie no inspeccionada en desarrollo), también requiere validación manual. `tiktok_comments`, al depender del DOM de Comment Management (misma superficie que `tiktok_comment_reply`), también requiere validación manual contra una cuenta real con comentarios. `tiktok_sounds`, al depender del DOM de Discover y de la presencia de links a `/music/<id>` (superficie no inspeccionada en desarrollo), también requiere validación manual. `tiktok_trending_topics`, al depender del DOM de Discover y de la presencia de links a `/tag/<slug>` (superficie no inspeccionada en desarrollo), también requiere validación manual. `tiktok_trending_creators`, al depender del DOM de Discover y de la presencia de links a `/@<handle>` (superficie no inspeccionada en desarrollo), también requiere validación manual. `tiktok_profile_analytics` (header del perfil propio; DOM no inspeccionado en desarrollo) y `tiktok_studio_analytics` (overview de Studio; DOM no inspeccionado en desarrollo) también requieren validación manual contra una cuenta real autenticada.
+- Unitarios/integración local: persistencia de cuentas y muestras de analíticas (recordSample dedup, series, latest), contrato de las 37 tools vía `InMemoryTransport` (nombres, ausencia de campos de pago, llamada a `tiktok_niches`), arranque real del binario empaquetado por stdio, contrato HTTP del cliente QR relay (con fetch inyectado). La fusión de media (`tiktok_mix_media`), el quiz visual (`tiktok_make_quiz`) y el duet/stitch (`tiktok_make_duet`) se validan con una ejecución manual real de `ffmpeg` sobre archivos de prueba; no hay test automatizado del binario. `tiktok_monetization_status` se implementó sin poder inspeccionar el DOM real (requiere cuenta apta autenticada): su validación final es manual. Igual para `tiktok_comment_reply`, que depende del DOM de Comment Management (requiere una cuenta con comentarios): validación final manual. `tiktok_pin_video`, que depende del menú de acciones del video, también requiere validación manual contra una cuenta real. `tiktok_playlist_manage` comparte la misma situación: solo está disponible para cuentas con 10k+ seguidores, así que su validación final es manual contra una cuenta apta. `tiktok_search` también se implementó sin inspeccionar el DOM de resultados en desarrollo (búsqueda pública): se lee por links reales + texto visible y su validación final es manual. `tiktok_comment` comparte la situación del watch page (DOM de comentarios no inspeccionado en desarrollo): selectores resilientes + read-back, validación final manual contra una cuenta real. `tiktok_like` y `tiktok_unlike`, al depender ambos del atributo `aria-pressed` del botón de like en el watch page (misma superficie no inspeccionada en desarrollo desde DEC-017), requieren validación manual: se debe confirmar que el like aparece realmente (y que un like repetido no hace unlike). `tiktok_unfollow`, al depender del estado textual del botón de follow en el perfil público y del posible diálogo de confirmación (superficie no inspeccionada en desarrollo), también requiere validación manual contra una cuenta con seguidores. `tiktok_delete_comment`, al depender del menú "…" de cada fila de comentario en Comment Management (superficie no inspeccionada en desarrollo), también requiere validación manual. `tiktok_comments`, al depender del DOM de Comment Management (misma superficie que `tiktok_comment_reply`), también requiere validación manual contra una cuenta real con comentarios. `tiktok_sounds`, al depender del DOM de Discover y de la presencia de links a `/music/<id>` (superficie no inspeccionada en desarrollo), también requiere validación manual. `tiktok_trending_topics`, al depender del DOM de Discover y de la presencia de links a `/tag/<slug>` (superficie no inspeccionada en desarrollo), también requiere validación manual. `tiktok_trending_creators`, al depender del DOM de Discover y de la presencia de links a `/@<handle>` (superficie no inspeccionada en desarrollo), también requiere validación manual. `tiktok_profile_analytics` (header del perfil propio; DOM no inspeccionado en desarrollo) y `tiktok_studio_analytics` (overview de Studio; DOM no inspeccionado en desarrollo) también requieren validación manual contra una cuenta real autenticada. `tiktok_live_discover` (feed LIVE público `/live`) y `tiktok_live_info` (room `/@<handle>/live`), al depender de superficies LIVE no inspeccionadas en desarrollo, también requieren validación manual.
 - **No existen tests de browser contra TikTok real automatizados.**
 
 Estrategia definida:
@@ -395,7 +395,7 @@ Estrategia definida:
 | 2 | Completar engagement: unlike/unfollow, comentarios (leer, escribir, responder, borrar) | En curso (escribir comentarios `tiktok_comment`; leer comentarios `tiktok_comments`; response en Studio `tiktok_comment_reply`; borrar comentarios `tiktok_delete_comment`; unlike `tiktok_unlike`; unfollow `tiktok_unfollow`) |
 | 3 | Discovery y trends: búsquedas (videos/usuarios/hashtags), tendencias, sounds | Completada (búsqueda `tiktok_search`; sounds `tiktok_sounds`; tendencias `tiktok_trending`; topics `tiktok_trending_topics`; creadores `tiktok_trending_creators`) |
 | 4 | Analytics avanzados: analíticas de perfil, métricas profundas de Studio, histórico más rico | Completada (`tiktok_profile_analytics` lee totales del perfil; `tiktok_studio_analytics` lee el overview de Studio de forma defensiva; registro en DEC-022) |
-| 5 | LIVE: descubrimiento, información e interacción | Planificado |
+| 5 | LIVE: descubrimiento, información e interacción | Completada (parcial): `tiktok_live_discover` lee el feed LIVE público; `tiktok_live_info` lee la room de un creador (ambos read-only, anónimos). Interacción y comentarios en LIVE fuera de alcance por ser superficies sensibles/no inspeccionadas; registro en DEC-023 |
 | 6 | Cobertura adicional: photo posts, drafts, edición de posts publicados, APIs oficiales donde apliquen (ya implementados: fusión de media `tiktok_mix_media`, quiz visual `tiktok_make_quiz`, duet/stitch local `tiktok_make_duet`, lectura de monetización `tiktok_monetization_status`, respuesta de comentarios `tiktok_comment_reply`, fijar videos `tiktok_pin_video` y playlists `tiktok_playlist_manage`) | Planificado |
 | 7 | Integración del agente con canales externos (WhatsApp/Telegram) | Planificado |
 
@@ -657,6 +657,19 @@ Decisión: implementar dos lecturas adicionales de analíticas propias: (1) `tik
 Motivo: cerrar la Fase 4 del roadmap ("Analíticas de perfil" y "Analíticas profundas de Studio"), que estaban en RESEARCH. Ambas son lecturas read-only sobre datos propios, de bajo riesgo, y reutilizan los patrones defensivos existentes (waitForHydrated, captureUiState, NOT_READY vs vacío) sin fabricar métricas.
 Alternativas consideradas: scrapear los gráficos internos de Studio vía canvas (rechazado: no se puede leer canvas sin inspeccionar el DOM real); estimar métricas (rechazado: nunca fabricar).
 Consecuencias: dos tools nuevas síncronas-de-ui vía job (`this.start`), consistentes con `tiktok_analytics`/`tiktok_monetization_status`. Reutiliza `resolveOwnProfileUrl` (extraído sin romper `openEditProfileModal`). Conteo pasa de 33 a 35 tools. Ambas superficies no inspeccionadas en desarrollo → validación manual pendiente contra una cuenta real autenticada.
+
+---
+
+## DEC-023 — Fase 5: LIVE (descubrimiento e información, `tiktok_live_discover` + `tiktok_live_info`)
+
+Fecha: 2026-08-31
+
+Estado: Aceptada (implementada v1, validación manual pendiente)
+Decisión: implementar dos lecturas read-only de LIVE: (1) `tiktok_live_discover` navega al feed LIVE público (`/live`) de forma anónima y extrae las rooms que TikTok muestra con links reales a `/@<handle>/live` y el snippet visible (título, viewers), devolviendo lista vacía si renderiza sin rooms y `NOT_READY` si no renderiza; (2) `tiktok_live_info` navega a `/@<handle>/live` (anónimo, read-only) y extrae solo lo observable (título, host/handle, viewers/likes visibles), reportando offline/unknown honestamente sin fabricar métricas ni scrapear URLs de stream ni capturar chat.
+Motivo: cerrar las capacidades "descubrir LIVE" e "información de LIVE" de la Fase 5, que estaban en RESEARCH. Ambas son lecturas públicas de bajo riesgo, consistentes con la capa anónima read-only de Discover (search/trending/sounds/topics/creators), y reutilizan los patrones defensivos existentes (launchLocalContext, waitForHydrated, captureUiState, NOT_READY vs vacío). Reutiliza `normalizeHandle`/`isValidHandle` (Fase 1) para validar el handle de `tiktok_live_info`.
+Alcance: "interacción en LIVE" (regalos/likes en vivo) y "comentarios en LIVE" (chat streaming) se dejan fuera de esta fase por ser superficies sensibles, no inspeccionadas y de alta complejidad — se documentan como NOT_PLANNED (v1) en la matriz LIVE.
+Alternativas consideradas: integrar APIs/proxys de terceros para rooms (rechazado: el proyecto prioriza self-hosted y lectura de lo que TikTok expone); conectarse a websockets de chat (rechazado para esta fase por complejidad y riesgo).
+Consecuencias: dos tools nuevas read-only/anónimas vía `launchLocalContext` (no jobs `this.start`, al no requerir sesión autenticada), consistentes con las tools de Discover. Validación de handle con `INVALID_INPUT`. Conteo pasa de 35 a 37 tools. Ambas superficies LIVE no inspeccionadas en desarrollo → validación manual pendiente contra una cuenta real.
 
 ---
 

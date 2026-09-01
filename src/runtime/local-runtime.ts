@@ -14,6 +14,8 @@ import {
   postVideo,
   profileAnalyticsFeed,
   searchByType,
+  liveDiscoverFeed,
+  liveInfoFeed,
   soundsFeed,
   studioAnalyticsFeed,
   trendingCreatorsFeed,
@@ -465,6 +467,16 @@ export class LocalTikTokRuntime {
   trendingCreators(input: { account_id?: string; country?: string; limit?: number }) {
     if (input.account_id) this.common(input.account_id);
     return trendingCreatorsFeed(input);
+  }
+
+  liveDiscover(input: { account_id?: string; country?: string; limit?: number }) {
+    if (input.account_id) this.common(input.account_id);
+    return liveDiscoverFeed(input);
+  }
+
+  liveInfo(input: { account_id?: string; country?: string; handle?: string }) {
+    if (input.account_id) this.common(input.account_id);
+    return liveInfoFeed(input);
   }
 
   scheduled(input: { account_id?: string; include_done?: boolean }) {

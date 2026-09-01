@@ -303,6 +303,26 @@ export function createTikTokServer(options: TikTokServerOptions = {}): McpServer
     },
   }, (args) => runtime.trendingCreators(args as any));
 
+  addTool(server, "tiktok_live_discover", {
+    title: "Discover live rooms",
+    description: "Read the rooms TikTok shows on its public LIVE feed (/live) with real links to /@<handle>/live and any visible snippet (title, viewers, host). Read-only, observed-only: returns an empty list when nothing is observed rather than fabricating a ranking. account_id optional (anonymous otherwise).",
+    inputSchema: {
+      account_id: ACCOUNT_ID.optional().describe("Optional local account to read within its session; anonymous otherwise"),
+      country: z.string().optional(),
+      limit: z.number().int().min(1).max(50).optional().describe("Defaults to 20"),
+    },
+  }, (args) => runtime.liveDiscover(args as any));
+
+  addTool(server, "tiktok_live_info", {
+    title: "Read live room info",
+    description: "Read the public detail of a creator's LIVE room by navigating to /@<handle>/live (anonymous, read-only): title, host, handle, viewer and like counts when visible. Does not scrape stream URLs or capture chat; reports offline/unknown honestly. Requires handle.",
+    inputSchema: {
+      account_id: ACCOUNT_ID.optional().describe("Optional local account to read within its session; anonymous otherwise"),
+      country: z.string().optional(),
+      handle: z.string().describe("Public TikTok handle of the creator, with or without the @ prefix"),
+    },
+  }, (args) => runtime.liveInfo(args as any));
+
   addTool(server, "tiktok_delete", {
     title: "Delete a TikTok video",
     description: "Delete one of the connected account's videos.",

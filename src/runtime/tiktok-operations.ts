@@ -3845,3 +3845,221 @@ export async function trendingCreatorsFeed(req: TikTokTrendingCreatorsRequest): 
   }
 }
 
+export interface TikTokLiveDiscoverRequest {
+  /** Optional local account to read within its authenticated session;
+   *  anonymous otherwise. */
+  account_id?: string;
+  country?: string;
+  /** Max rooms to return. Defaults to 20. */
+  limit?: number;
+}
+
+/**
+ * Discover currently-live rooms from the public TikTok LIVE feed
+ * (`/live`, the "For You" LIVE surface). Read-only, anonymous: returns the
+ * live rooms TikTok shows with real links to `/@<handle>/live` plus any
+ * visible snippet (title / viewers / host). The LIVE DOM was not captured in
+ * this development environment, so the scraping is deliberately defensive and
+ * keyed off observable structure (real anchor hrefs + surrounding text),
+ * never hard-coded fragile class names. Reports NOT_READY if the surface
+ * never renders, and an empty list (not fabricated data) if it renders
+ * without obvious rooms.
+ */
+export async function liveDiscoverFeed(req: TikTokLiveDiscoverRequest): Promise<TikTokOpResult<{ source: string; results: any[]; total_observed: number }>> {
+  const limit = req.limit && req.limit > 0 ? Math.min(req.limit, 50) : 20;
+
+  let session;
+  try {
+    session = await launchLocalContext({
+      accountId: req.account_id || "__live_discover__",
+      cookies: [],
+      country: req.country,
+      loadMedia: false,
+    });
+  } catch (e: any) {
+    return { success: false, error: `Failed to open session: ${e.message}`, error_code: "LAUNCH_FAILED" };
+  }
+
+  const { page, close } = session;
+  try {
+    await page.goto("https://www.tiktok.com/live", { waitUntil: "domcontentloaded", timeout: 45000 });
+
+    const rendered = await waitForHydrated(
+      page,
+      {
+        label: "live-discover",
+        predicate: `(() => {
+          const links = document.querySelectorAll('a[href]');
+          let n = 0;
+          for (const a of links) {
+            if (/\\/@[^/?#]+\\/live/.test(a.getAttribute('href') || '')) n++;
+          }
+          return n > 0 ? 'rendered' : null;
+        })()`,
+      },
+      { timeoutMs: 30000 },
+    );
+
+    if (!rendered) {
+      const bodyText = (await page.evaluate(`document.body ? (document.body.textContent || '') : ''`).catch(() => "")) as string;
+      if (bodyText && /live|viewers?|watching/i.test(bodyText)) {
+        return { success: true, data: { source: "live", results: [], total_observed: 0 } };
+      }
+      const diag = await captureUiState(page, "live-discover-not-rendered");
+      return {
+        success: false,
+        error: "The LIVE feed never rendered its rooms, so no live streams were read.",
+        error_code: "NOT_READY",
+        data: diag as any,
+      };
+    }
+
+    const scraped: any = await page.evaluate(
+      (lim) => {
+        const out: any[] = [];
+        const seen = new Set();
+        const links = Array.from(document.querySelectorAll("a[href]"));
+        for (const a of links) {
+          const href = a.getAttribute("href") || "";
+          const m = href.match(/\/@([^/?#]+)\/live/);
+          if (!m) continue;
+          const handle = m[1];
+          const key = `@${handle}/live`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const el: any = a;
+          const texts: string[] = [];
+          let node: any = el;
+          for (let i = 0; i < 8 && node; i++) {
+            const t = (node.innerText || "").replace(/\s+/g, " ").trim();
+            if (t) texts.unshift(t);
+            node = node.parentElement;
+          }
+          const snippet = texts.reduce((acc, x) => (acc.includes(x) ? acc : acc + " · " + x), "");
+          const viewersMatch = snippet.match(/([\d.,]+\s*[KMB]?)\s*(watching|viewers|espectadores?|viendo)/i);
+          out.push({
+            handle: `@${handle}`,
+            url: `https://www.tiktok.com/@${handle}/live`,
+            snippet: snippet.slice(0, 400),
+            viewers_count: viewersMatch ? viewersMatch[1] : null,
+          });
+          if (out.length >= lim) break;
+        }
+        return out;
+      },
+      limit,
+    ).catch((e: any) => ({ error: String(e?.message || e) }));
+
+    if (!scraped || scraped.error) {
+      const diag = await captureUiState(page, "live-discover-scrape-failed");
+      return { success: false, error: "Could not read the LIVE surface (unexpected structure).", error_code: "UI_TIMEOUT", data: diag as any };
+    }
+
+    return { success: true, data: { source: "live", results: scraped as any[], total_observed: (scraped as any[]).length } };
+  } catch (e: any) {
+    const diag = await captureUiState(page, "live-discover-error").catch(() => ({}));
+    return { success: false, error: e.message || String(e), error_code: "UNKNOWN", data: diag as any };
+  } finally {
+    await close();
+  }
+}
+
+export interface TikTokLiveInfoRequest {
+  /** Optional local account to read within its authenticated session;
+   *  anonymous otherwise. */
+  account_id?: string;
+  country?: string;
+  /** Public TikTok handle of the creator, with or without the @ prefix. */
+  handle?: string;
+}
+
+/**
+ * Read the detail of a single public LIVE room for a given creator by
+ * navigating to `https://www.tiktok.com/@<handle>/live` (anonymous, read-only).
+ * Only reports observable, public data (title, viewer count, host + handle);
+ * there is no live stream URL scraping and no chat capture. If the room is
+ * offline/ended or the page never renders, returns its state honestly rather
+ * than fabricating metrics.
+ */
+export async function liveInfoFeed(req: TikTokLiveInfoRequest): Promise<TikTokOpResult<{ handle: string; room: any; status: string; scraped_at: string }>> {
+  const handle = normalizeHandle(req.handle || "");
+  if (!isValidHandle(handle)) {
+    return { success: false, error: `Invalid TikTok handle: "${req.handle}".`, error_code: "INVALID_INPUT" };
+  }
+
+  let session;
+  try {
+    session = await launchLocalContext({
+      accountId: req.account_id || "__live_info__",
+      cookies: [],
+      country: req.country,
+      loadMedia: false,
+    });
+  } catch (e: any) {
+    return { success: false, error: `Failed to open session: ${e.message}`, error_code: "LAUNCH_FAILED" };
+  }
+
+  const { page, close } = session;
+  try {
+    await page.goto(`https://www.tiktok.com/@${handle}/live`, { waitUntil: "domcontentloaded", timeout: 45000 });
+
+    const rendered = await waitForHydrated(
+      page,
+      {
+        label: "live-info",
+        predicate: `(() => {
+          if (/Room not found/i.test(document.title || '')) return 'gone';
+          const viewers = [...document.querySelectorAll('strong[title]')]
+            .filter((s) => /viewer|watching|live/i.test((s.getAttribute('title') || '') + ' ' + (s.textContent || '')));
+          return viewers.length > 0 ? 'rendered' : null;
+        })()`,
+      },
+      { timeoutMs: 30000 },
+    );
+
+    const room: any = await page.evaluate(`(() => {
+      const parseNum = (t) => {
+        if (t == null) return null;
+        const m = String(t).trim().replace(/,/g, '').match(/^([\\d.]+)\\s*([KMB])?$/i);
+        if (!m) return null;
+        let n = parseFloat(m[1]); const u = (m[2] || '').toUpperCase();
+        if (u === 'K') n *= 1e3; else if (u === 'M') n *= 1e6; else if (u === 'B') n *= 1e9;
+        return Math.round(n);
+      };
+      const data = { title: '', host: '', handle: '', viewers: null, likes: null };
+      const h1s = document.querySelectorAll('h1');
+      for (const h of h1s) {
+        const t = (h.textContent || '').trim();
+        if (t && t.length > 1 && t.length < 200) { data.title = t; break; }
+      }
+      const hostEl = document.querySelector('[data-e2e="live-streamer-name"], [data-e2e="live-nickname"], a[href^="/@"]');
+      if (hostEl) data.host = (hostEl.textContent || '').trim();
+      const handleEl = document.querySelector('[data-e2e="live-streamer-username"], a[href^="/@"]');
+      if (handleEl) {
+        const m = (handleEl.getAttribute('href') || '').match(/\\/@([^/?#]+)/);
+        if (m) data.handle = '@' + m[1];
+      }
+      for (const s of document.querySelectorAll('strong[title]')) {
+        const title = (s.getAttribute('title') || '').toLowerCase();
+        const txt = (s.textContent || '') + ' ' + (s.getAttribute('data-e2e') || '');
+        if (/viewer|watching|live/i.test(title + ' ' + txt)) data.viewers = parseNum(s.textContent || '');
+        else if (/like/i.test(title + ' ' + txt)) data.likes = parseNum(s.textContent || '');
+      }
+      return data;
+    })()`).catch((e: any) => ({ error: String(e?.message || e) }));
+
+    if (!room || room.error) {
+      const diag = await captureUiState(page, "live-info-scrape-failed");
+      return { success: false, error: "Could not read the LIVE room (unexpected structure).", error_code: "UI_TIMEOUT", data: diag as any };
+    }
+
+    const status = rendered === "rendered" ? "live" : rendered === "gone" ? "offline" : "unknown";
+    return { success: true, data: { handle, room, status, scraped_at: new Date().toISOString() } };
+  } catch (e: any) {
+    const diag = await captureUiState(page, "live-info-error").catch(() => ({}));
+    return { success: false, error: e.message || String(e), error_code: "UNKNOWN", data: diag as any };
+  } finally {
+    await close();
+  }
+}
+
