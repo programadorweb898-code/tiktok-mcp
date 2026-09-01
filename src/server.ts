@@ -421,6 +421,16 @@ export function createTikTokServer(options: TikTokServerOptions = {}): McpServer
     inputSchema: {},
   }, () => runtime.niches());
 
+  addTool(server, "telegram_send", {
+    title: "Send a Telegram message",
+    description: "Send a text message to a Telegram chat via the Bot API (outbound only, does not touch TikTok). Token comes from TELEGRAM_BOT_TOKEN (or token) and the target chat from TELEGRAM_CHAT_ID (or chat_id). Fails cleanly when not configured.",
+    inputSchema: {
+      text: z.string().min(1).describe("Message text to send"),
+      chat_id: z.union([z.number(), z.string()]).optional().describe("Target chat id; defaults to TELEGRAM_CHAT_ID"),
+      token: z.string().optional().describe("Bot token; defaults to TELEGRAM_BOT_TOKEN"),
+    },
+  }, (args) => runtime.telegramSend(args));
+
   addTool(server, "tiktok_scheduled", {
     title: "List scheduled TikTok posts",
     description: "List native scheduled posts recorded by this local MCP.",

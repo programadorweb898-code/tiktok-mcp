@@ -37,6 +37,7 @@ import { makeQuizVideo, type MakeQuizRequest } from "./media-quiz.js";
 import { makeDuetVideo, type MakeDuetRequest } from "./media-duet.js";
 import { launchLocalContext } from "./social-runtime.js";
 import { LOCATION_GUIDANCE, QrRelayClient, type QrRelaySession } from "./qr-relay.js";
+import { TelegramClient, telegramBotToken, telegramChatId } from "./telegram.js";
 import {
   getAccount,
   getOperation,
@@ -447,6 +448,28 @@ export class LocalTikTokRuntime {
 
   niches() {
     return { count: NICHES.length, niches: NICHES.map(({ id, label, aliases }) => ({ id, label, aliases })) };
+  }
+
+  /**
+   * Send a Telegram message via the Bot API. Token/channel come from the
+   * environment (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID) unless overridden.
+   * Best-effort: does not touch TikTok and needs no session.
+   */
+  async telegramSend(input: Record<string, any>) {
+    const token = input.token || telegramBotToken();
+    const chatId = input.chat_id ?? telegramChatId();
+    if (!token) return { success: false, error: "TELEGRAM_BOT_TOKEN is not configured (set it or pass token).", error_code: "INVALID_INPUT" };
+    if (!chatId) return { success: false, error: "TELEGRAM_CHAT_ID is not configured (set it or pass chat_id).", error_code: "INVALID_INPUT" };
+    if (!input.text || typeof input.text !== "string" || !input.text.trim()) {
+      return { success: false, error: "text is required", error_code: "INVALID_INPUT" };
+    }
+    try {
+      const client = new TelegramClient(token);
+      const result = await client.sendMessage(input.text, chatId);
+      return { success: true, data: result };
+    } catch (e: any) {
+      return { success: false, error: e.message || String(e), error_code: "UNKNOWN" };
+    }
   }
 
   search(input: { account_id?: string; query: string; type?: "video" | "user" | "hashtag"; country?: string; limit?: number }) {
