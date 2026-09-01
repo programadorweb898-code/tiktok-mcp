@@ -59,7 +59,8 @@ TikTok Operations        — src/runtime/tiktok-operations.ts
                           updateProfile, updateAvatar, analyzePosts…)
 Browser / APIs internas  — social-runtime.ts (Playwright),
                           social-selectors.ts, media-fetch.ts,
-                          social-rate-limit.ts, qr-relay.ts
+                          social-rate-limit.ts, qr-relay.ts,
+                          op-validators.ts (validación de input y mapeo de errores)
         ↓
 TikTok (web + TikTok Studio)
 ```
@@ -77,6 +78,7 @@ TikTok (web + TikTok Studio)
 | `src/runtime/media-duet.ts` | Composición local de duet/stitch: arma un video de pantalla dividida (duet) o un clip inicial del video ajeno seguido del propio (stitch) con ffmpeg. Detecta si cada clip tiene audio y lo mezcla/concatena (o usa silencio). Produce un MP4 listo para `tiktok_post`. |
 | `src/runtime/social-runtime.ts` | Lanzamiento de Chromium (`launchPersistentContext`) por cuenta, perfiles de país (locale + timezone, 19 países), lock por cuenta, detección de navegador instalado, Xvfb en Linux sin DISPLAY, bloqueo de telemetría/media pesada, tracking de requests pendientes. |
 | `src/runtime/social-selectors.ts` | Resolución resiliente de elementos (`resolveElement`), probes de hidratación (`waitForHydrated`, `HYDRATION_PROBES`), snapshot de accesibilidad (`axSnapshot`). |
+| `src/runtime/op-validators.ts` | Validadores puros y sin efectos (normalización/validación de handles y video permaLinks, mapeo de códigos de error de TikTok al enum `OpErrorCode`). Separados de las operaciones para poder testearlos sin Chromium. |
 | `src/runtime/social-rate-limit.ts` | Rate limiting protector local. |
 | `src/runtime/store.ts` | Persistencia local atómica en `~/.tiktok-mcp/state.json`: cuentas, operaciones, métricas, acciones. Perfiles de navegador en `profiles/<account_id>`. |
 | `src/runtime/qr-relay.ts` | Cliente del relay QR efímero para el login remoto. |
@@ -87,6 +89,8 @@ TikTok (web + TikTok Studio)
 | `src/runtime/tiktok-niches.ts` | Lista estática de 24 nichos para el análisis de hooks. |
 | `src/runtime/tiktok-accounts.ts` | Helper de listado de cuentas por owner/tag (hoy delega en `store.listAccounts`). |
 | `src/tests/local.test.ts` | Tests con `node:test`. |
+| `src/tests/op-validators.test.ts` | Tests unitarios de los validadores puros (`normalizeHandle`, `isValidHandle`, `isValidVideoPermalink`, `mapTikTokError`). Sin navegador. |
+| `src/tests/social-selectors.test.ts` | Tests unitarios de la capa de estabilización (`resolveElement`, `waitForHydrated`, `axSnapshot`) con page mock, sin Chromium. |
 
 ### Modelo de ejecución
 
@@ -332,8 +336,9 @@ Separación estricta entre datos observados de TikTok y cálculo local:
 
 ## 13. Testing
 
-Actual (`npm test` = build + `node --test dist/tests/local.test.js`, framework `node:test`):
+Actual (`npm test` = build + `node --test dist/tests/*.test.js`, framework `node:test`):
 
+- Unitarios puros (sin navegador): validadores de input y mapeo de errores (`op-validators.test.ts` — `normalizeHandle`, `isValidHandle`, `isValidVideoPermalink`, `mapTikTokError`) y capa de estabilización de selectores (`social-selectors.test.ts` — `resolveElement` con fallback, `waitForHydrated` con timeout sin lanzar, `axSnapshot`). Estos tests detectaron y fijaron un bug real de `normalizeHandle`: el orden `replace(/^@/).trim()` dejaba un `@` inicial cuando había espacios antes del handle (p. ej. `"  @brand"`), ahora `trim()` primero y luego quita el `@` (DEC-021).
 - Unitarios/integración local: persistencia de cuentas y muestras de analíticas (recordSample dedup, series, latest), contrato de las 33 tools vía `InMemoryTransport` (nombres, ausencia de campos de pago, llamada a `tiktok_niches`), arranque real del binario empaquetado por stdio, contrato HTTP del cliente QR relay (con fetch inyectado). La fusión de media (`tiktok_mix_media`), el quiz visual (`tiktok_make_quiz`) y el duet/stitch (`tiktok_make_duet`) se validan con una ejecución manual real de `ffmpeg` sobre archivos de prueba; no hay test automatizado del binario. `tiktok_monetization_status` se implementó sin poder inspeccionar el DOM real (requiere cuenta apta autenticada): su validación final es manual. Igual para `tiktok_comment_reply`, que depende del DOM de Comment Management (requiere una cuenta con comentarios): validación final manual. `tiktok_pin_video`, que depende del menú de acciones del video, también requiere validación manual contra una cuenta real. `tiktok_playlist_manage` comparte la misma situación: solo está disponible para cuentas con 10k+ seguidores, así que su validación final es manual contra una cuenta apta. `tiktok_search` también se implementó sin inspeccionar el DOM de resultados en desarrollo (búsqueda pública): se lee por links reales + texto visible y su validación final es manual. `tiktok_comment` comparte la situación del watch page (DOM de comentarios no inspeccionado en desarrollo): selectores resilientes + read-back, validación final manual contra una cuenta real. `tiktok_like` y `tiktok_unlike`, al depender ambos del atributo `aria-pressed` del botón de like en el watch page (misma superficie no inspeccionada en desarrollo desde DEC-017), requieren validación manual: se debe confirmar que el like aparece realmente (y que un like repetido no hace unlike). `tiktok_unfollow`, al depender del estado textual del botón de follow en el perfil público y del posible diálogo de confirmación (superficie no inspeccionada en desarrollo), también requiere validación manual contra una cuenta con seguidores. `tiktok_delete_comment`, al depender del menú "…" de cada fila de comentario en Comment Management (superficie no inspeccionada en desarrollo), también requiere validación manual. `tiktok_comments`, al depender del DOM de Comment Management (misma superficie que `tiktok_comment_reply`), también requiere validación manual contra una cuenta real con comentarios. `tiktok_sounds`, al depender del DOM de Discover y de la presencia de links a `/music/<id>` (superficie no inspeccionada en desarrollo), también requiere validación manual. `tiktok_trending_topics`, al depender del DOM de Discover y de la presencia de links a `/tag/<slug>` (superficie no inspeccionada en desarrollo), también requiere validación manual. `tiktok_trending_creators`, al depender del DOM de Discover y de la presencia de links a `/@<handle>` (superficie no inspeccionada en desarrollo), también requiere validación manual.
 - **No existen tests de browser contra TikTok real automatizados.**
 
@@ -386,7 +391,7 @@ Estrategia definida:
 
 | Fase | Alcance | Estado |
 |---|---|---|
-| 1 | Estabilizar el MCP existente: comprender la arquitectura, pruebas, endurecer selectores y errores | En curso |
+| 1 | Estabilizar el MCP existente: comprender la arquitectura, pruebas, endurecer selectores y errores | Completada (tests unitarios de estabilización `op-validators.test.ts` + `social-selectors.test.ts`; centralización de validadores/mapeo de errores en `op-validators.ts`; registro en DEC-021) |
 | 2 | Completar engagement: unlike/unfollow, comentarios (leer, escribir, responder, borrar) | En curso (escribir comentarios `tiktok_comment`; leer comentarios `tiktok_comments`; response en Studio `tiktok_comment_reply`; borrar comentarios `tiktok_delete_comment`; unlike `tiktok_unlike`; unfollow `tiktok_unfollow`) |
 | 3 | Discovery y trends: búsquedas (videos/usuarios/hashtags), tendencias, sounds | Completada (búsqueda `tiktok_search`; sounds `tiktok_sounds`; tendencias `tiktok_trending`; topics `tiktok_trending_topics`; creadores `tiktok_trending_creators`) |
 | 4 | Analytics avanzados: analíticas de perfil, métricas profundas de Studio, histórico más rico | Planificado |
@@ -627,6 +632,19 @@ Decisión: implementar `tiktok_trending_creators` para leer los creadores que Ti
 Motivo: los creadores eran la última capacidad pendiente de la Fase 3 (Discovery/trends); con esto la Fase 3 queda cubierta y un agente puede descubrir contenido, sonidos, temas y perfiles en tendencia para orientar estrategia de contenido y colaboraciones.
 Alternativas consideradas: reutilizar `tiktok_search` (`type: user`) como único camino a creadores (rechazado: es búsqueda dirigida, no descubrimiento de tendencia); inventar una URL dedicada de creators trending (rechazado: no conocida de forma estable).
 Consecuencias: la tool es síncrona de lectura (no pasa por un job ni está sujeta al cap protector). Depende de que Discover exponga links a `/@<handle>` — superficie no inspeccionada en desarrollo, por lo que su validación final es manual contra TikTok real. Conteo pasa de 32 a 33 tools.
+
+---
+
+## DEC-021 — Fase 1: estabilización (validadores puros testables + tests unitarios de la capa de selectores)
+
+Fecha: 2026-08-31
+
+Estado: Aceptada (cierra Fase 1)
+Decisión: crear `src/runtime/op-validators.ts` con los validadores puros y sin efectos que antes vivían inline en las operaciones — `normalizeHandle`, `isValidHandle`, `isValidVideoPermalink` (reutilizados en follow/unfollow/like/unlike/comment reemplazando duplicados) y `mapTikTokError` (movido desde `tiktok-operations.ts`) — para poder testearlos sin Chromium. El script `test` ahora corre todos los `dist/tests/*.test.js` (antes solo `local.test.js`). Se añadieron `op-validators.test.ts` y `social-selectors.test.ts` (resolveElement con fallback, waitForHydrated, axSnapshot con page mock).
+Motivo: "endurecer errores/pruebas" de la Fase 1 sin tocar el comportamiento de las operaciones en producción ni arriesgar selectores contra DOM real no inspeccionado. Centraliza lógica duplicada (no duplicar lógica) y da cobertura automatizada a las decisiones que gatean cada operación.
+Bug detectado y fijado: el orden de `normalizeHandle` era `replace(/^@/).trim()`; con input con espacios antes del `@` (`"  @brand"`) no se quitaba el `@` y quedaba inválido o producía una URL con `@` duplicado. Se corrigió a `trim()` primero y luego `replace(/^@/,"")`. Los tests assert sobre handles con/without espaciado evitan una regresión.
+Alternativas consideradas: endurecer selectores de producción (rechazado por ahora: las ops ya son resilientes por links/roles y modificar selectores sin poder probar contra TikTok real — superficie no inspeccionada en desarrollo — contradice "no romper herramientas existentes"); escribir tests que arranquen Chromium (rechazado: pesado y no repetible en CI).
+Consecuencias: no cambia el conteo de tools (33) ni rompe contratos; `mapTikTokError` pasa a `op-validators.ts` con el mismo enum extensible `OpErrorCode` (compatible estructuralmente con `TikTokOpResult["error_code"]`). Aumenta de 4 a 18 los tests unitarios/integración ejecutados por `npm test`.
 
 ---
 

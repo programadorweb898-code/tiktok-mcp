@@ -18,6 +18,7 @@ import { checkRateLimit, recordAction } from "./social-rate-limit.js";
 import { resolveElement, axSnapshot, waitForHydrated, HYDRATION_PROBES } from "./social-selectors.js";
 import { wallClockInTz, pad2, type WallClock } from "./schedule-time.js";
 import { recordSample, postedAtFromVideoId } from "./tiktok-metrics.js";
+import { mapTikTokError, normalizeHandle, isValidHandle, isValidVideoPermalink } from "./op-validators.js";
 
 const MAX_VIDEO_BYTES = 100 * 1024 * 1024;   // 100 MB — covers up to ~90s @ typical bitrate
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;    // 10 MB
@@ -381,25 +382,6 @@ async function submitAndAwaitTikTokApi(
     errorMessage,
     statusCode,
   };
-}
-
-/**
- * Map TikTok error codes to our error_code enum.
- * Observed codes (approximate — not officially documented):
- *   0      = success
- *   8      = session expired / not logged in
- *   10000+ = rate-limited / flood control
- *   20000+ = captcha / security check
- *   3xxxx  = content rejected (duplicate, banned keyword, etc.)
- */
-function mapTikTokError(status: number, code?: number): TikTokOpResult["error_code"] {
-  if (status === 401 || status === 403 || code === 8) return "SESSION_EXPIRED";
-  if (status === 429) return "RATE_LIMITED";
-  if (status === 404) return "NOT_FOUND";
-  if (code && code >= 20000 && code < 30000) return "CAPTCHA_CHALLENGE";
-  if (code && code >= 10000 && code < 20000) return "RATE_LIMITED";
-  if (code && code >= 30000 && code < 40000) return "INVALID_INPUT";
-  return "UNKNOWN";
 }
 
 /* ─── Pre-op gate: rate-limit check ────────────────────────────────────── */
@@ -935,8 +917,8 @@ export async function followUser(req: TikTokFollowRequest): Promise<TikTokOpResu
   const blocked = gate(req.account_id, "follow");
   if (blocked) return blocked;
 
-  const handle = req.target_user.replace(/^@/, "").trim();
-  if (!/^[A-Za-z0-9._]{2,24}$/.test(handle)) {
+  const handle = normalizeHandle(req.target_user);
+  if (!isValidHandle(handle)) {
     return { success: false, error: "target_user must be a valid TikTok handle", error_code: "INVALID_INPUT" };
   }
 
@@ -1061,8 +1043,8 @@ export async function unfollowUser(req: TikTokFollowRequest): Promise<TikTokOpRe
   const blocked = gate(req.account_id, "follow");
   if (blocked) return blocked;
 
-  const handle = req.target_user.replace(/^@/, "").trim();
-  if (!/^[A-Za-z0-9._]{2,24}$/.test(handle)) {
+  const handle = normalizeHandle(req.target_user);
+  if (!isValidHandle(handle)) {
     return { success: false, error: "target_user must be a valid TikTok handle", error_code: "INVALID_INPUT" };
   }
 
@@ -1185,7 +1167,7 @@ export async function likeVideo(req: TikTokLikeRequest): Promise<TikTokOpResult<
   const blocked = gate(req.account_id, "like");
   if (blocked) return blocked;
 
-  if (!/^https:\/\/(www\.)?tiktok\.com\/@[A-Za-z0-9._]+\/video\/\d+/.test(req.video_url)) {
+  if (!isValidVideoPermalink(req.video_url)) {
     return { success: false, error: "video_url must be a TikTok /video/ permalink", error_code: "INVALID_INPUT" };
   }
 
@@ -1293,7 +1275,7 @@ export async function unlikeVideo(req: TikTokLikeRequest): Promise<TikTokOpResul
   const blocked = gate(req.account_id, "like");
   if (blocked) return blocked;
 
-  if (!/^https:\/\/(www\.)?tiktok\.com\/@[A-Za-z0-9._]+\/video\/\d+/.test(req.video_url)) {
+  if (!isValidVideoPermalink(req.video_url)) {
     return { success: false, error: "video_url must be a TikTok /video/ permalink", error_code: "INVALID_INPUT" };
   }
 
@@ -2447,7 +2429,7 @@ export async function commentOnVideo(req: TikTokCommentOnVideoRequest): Promise<
   const blocked = gate(req.account_id, "comment");
   if (blocked) return blocked;
 
-  if (!/^https:\/\/(www\.)?tiktok\.com\/@[A-Za-z0-9._]+\/video\/\d+/.test(req.video_url)) {
+  if (!isValidVideoPermalink(req.video_url)) {
     return { success: false, error: "video_url must be a TikTok /video/ permalink", error_code: "INVALID_INPUT" };
   }
   const comment = (req.comment || "").trim();
