@@ -24,6 +24,7 @@ You can connect unlimited number of accounts. The agent will keep all TikTok ses
 | `tiktok_connect_status`   | Check whether login completed             |
 | `tiktok_accounts`         | List local accounts and session state     |
 | `tiktok_post`             | Post or natively schedule a video         |
+| `tiktok_photo_post`       | Post or natively schedule a photo carousel |
 | `tiktok_mix_media`        | Merge a separate audio track into a video (use a sound) |
 | `tiktok_make_quiz`        | Burn a question + options onto a video    |
 | `tiktok_make_duet`        | Compose a duet (split screen) or stitch MP4 |

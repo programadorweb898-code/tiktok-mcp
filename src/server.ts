@@ -94,6 +94,30 @@ export function createTikTokServer(options: TikTokServerOptions = {}): McpServer
     return runtime.post(args);
   });
 
+  addTool(server, "tiktok_photo_post", {
+    title: "Post a photo carousel",
+    description: "Publish a photo carousel (1-35 images) through the connected browser profile, or schedule it via TikTok's native scheduler. Accepts image_path / image_url / image_base64 per image, preserving order. The carousel edit surface is not yet manually validated.",
+    inputSchema: {
+      account_id: ACCOUNT_ID,
+      caption: z.string().min(1).max(2200),
+      images: z.array(z.object({
+        image_path: z.string().optional().describe("Local image path; the file stays on this device"),
+        image_url: z.string().url().optional(),
+        image_base64: z.string().optional(),
+      })).min(1).max(35).describe("1-35 images to post as a carousel, in order"),
+      privacy: z.number().int().min(0).max(2).optional(),
+      allow_comments: z.boolean().optional(),
+      allow_duet: z.boolean().optional(),
+      allow_stitch: z.boolean().optional(),
+      schedule_at: z.string().optional().describe("ISO-8601 time, roughly 15 minutes to 10 days ahead"),
+    },
+  }, (args) => {
+    for (const img of (args.images || [])) {
+      requireOne(img, ["image_path", "image_url", "image_base64"]);
+    }
+    return runtime.photoPost(args);
+  });
+
   addTool(server, "tiktok_mix_media", {
     title: "Mix a video with a separate audio track",
     description: "Merge an audio file into a video locally with ffmpeg (no upload). Returns the mixed MP4 path to feed to tiktok_post via video_path.",

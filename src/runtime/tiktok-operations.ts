@@ -4063,3 +4063,252 @@ export async function liveInfoFeed(req: TikTokLiveInfoRequest): Promise<TikTokOp
   }
 }
 
+export interface TikTokPhotoPostRequest extends TikTokPostRequest {
+  /**
+   * 1..N images to post as a carousel. Each entry is any of
+   * image_path / image_url / image_base64. Order is preserved.
+   */
+  images: ImageInput[];
+}
+
+/**
+ * Post a photo carousel (1..N images) to TikTok via Studio. Mirrors `postVideo`
+ * (caption, native schedule, privacy, comments/duet/stitch toggles, submit +
+ * verification) but uploads an array of images. The carousel "edit" surface
+ * (the screen Studio interposes between upload and caption) was NOT inspected
+ * in this development environment, so this is deliberately defensive: it
+ * uploads all images, tries to advance through a generic next/edit button by
+ * visible text, and otherwise tries the caption editor directly — never
+ * fabricating a success. If the editor never renders it reports NOT_READY /
+ * UPLOAD_FAILED with diagnostics. DOM not inspected → manual validation pending.
+ */
+export async function postPhotoFeed(req: TikTokPhotoPostRequest): Promise<TikTokOpResult<{ video_url?: string; video_id?: string; scheduled_at?: string }>> {
+  const blocked = gate(req.account_id, "post");
+  if (blocked) return blocked;
+
+  if (!req.caption || req.caption.length > 4000) {
+    return { success: false, error: "caption must be 1-4000 chars", error_code: "INVALID_INPUT" };
+  }
+  if (!req.images || req.images.length < 1) {
+    return { success: false, error: "images must contain at least 1 image", error_code: "INVALID_INPUT" };
+  }
+  if (req.images.length > 35) {
+    return { success: false, error: "images must contain at most 35 images", error_code: "INVALID_INPUT" };
+  }
+
+  let scheduleWhen: WallClock | undefined;
+  if (req.schedule_at) {
+    const at = new Date(req.schedule_at);
+    if (isNaN(at.getTime())) {
+      return { success: false, error: "schedule_at must be a valid ISO-8601 datetime", error_code: "INVALID_INPUT" };
+    }
+    const now = Date.now();
+    if (at.getTime() < now + 15 * 60 * 1000) {
+      return { success: false, error: "schedule_at must be at least ~15 minutes in the future (TikTok's minimum)", error_code: "INVALID_INPUT" };
+    }
+    if (at.getTime() > now + 10 * 24 * 60 * 60 * 1000) {
+      return { success: false, error: "schedule_at must be within ~10 days (TikTok's maximum)", error_code: "INVALID_INPUT" };
+    }
+    scheduleWhen = wallClockInTz(at, profileForCountry(req.country).timezoneId);
+  }
+
+  const cleaned: Array<() => void> = [];
+  let imagePaths: string[] = [];
+  try {
+    for (const img of req.images) {
+      const m = await materializeImage(img);
+      cleaned.push(m.cleanup);
+      imagePaths.push(m.filePath);
+    }
+  } catch (e: any) {
+    cleaned.forEach((c) => { try { c(); } catch {} });
+    return { success: false, error: e.message, error_code: "INVALID_INPUT" };
+  }
+
+  let session;
+  try {
+    session = await openAuthenticatedSession({
+      accountId: req.account_id,
+      proxySessionId: req.proxy_session_id,
+      cookies: req.cookies,
+      country: req.country,
+    });
+  } catch (e: any) {
+    cleaned.forEach((c) => { try { c(); } catch {} });
+    return { success: false, error: `Failed to open session: ${e.message}`, error_code: "LAUNCH_FAILED" };
+  }
+
+  const { page, close } = session;
+  try {
+    await page.goto("https://www.tiktok.com/tiktokstudio/upload?from=webapp", {
+      waitUntil: "domcontentloaded",
+      timeout: 60000,
+    });
+
+    const fileInput = page.locator('input[type="file"]').first();
+    await fileInput.setInputFiles(imagePaths);
+
+    // TikTok interposes a carousel "edit" step between upload and the caption
+    // editor. It was not inspected here, so try to advance through any visible
+    // next/edit/done control by generic visible text before falling back to the
+    // caption editor directly (the flow may not require a click).
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await page.waitForTimeout(1200);
+      const advance = await resolveElement(page, [
+        { name: "text-next", build: (p) => p.getByRole("button", { name: /^(next|edit|continue|done|save|apply)$/i }) },
+        { name: "text-any", build: (p) => p.locator('button:has-text("Next"), button:has-text("Edit"), button:has-text("Continue"), button:has-text("Done"), button:has-text("Save"), button:has-text("Apply")') },
+      ], { firstTimeoutMs: 6000, perStrategyMs: 1500 });
+      if (advance) {
+        await advance.locator.click({ timeout: 3000 }).catch(() => {});
+      } else {
+        break;
+      }
+    }
+
+    const caption = await resolveElement(page, [
+      { name: "data-e2e", build: (p) => p.locator('[data-e2e="upload-editor-caption"]') },
+      { name: "aria-label", build: (p) => p.locator('[aria-label*="aption" i], [aria-label*="escription" i]') },
+      { name: "role-textbox", build: (p) => p.getByRole("textbox") },
+      { name: "contenteditable", build: (p) => p.locator('div[contenteditable="true"]') },
+    ], { firstTimeoutMs: 90000, perStrategyMs: 6000 });
+    if (!caption) {
+      const diag = await captureUiState(page, "photo-upload-editor-missing");
+      return {
+        success: false,
+        error: "Caption editor never appeared — images rejected at upload, the carousel edit step blocked, or the selector rotated.",
+        error_code: "UPLOAD_FAILED",
+        data: diag as any,
+      };
+    }
+    const captionBox = caption.locator;
+    console.error(`[tiktok] photo caption editor resolved via ${caption.strategy}`);
+
+    if (await dismissBlockingModal(page)) console.error("[tiktok] dismissed a blocking modal overlay");
+
+    await captionBox.click();
+    await page.keyboard.press("Control+A");
+    await page.keyboard.press("Delete");
+    await captionBox.pressSequentially(req.caption, { delay: 15 });
+    await page.waitForTimeout(500);
+
+    if (scheduleWhen) {
+      const sched = await applySchedule(page, scheduleWhen);
+      if (!sched.ok) {
+        const diag = await captureUiState(page, "photo-schedule-setup-failed");
+        return {
+          success: false,
+          error: `Could not set TikTok's native schedule (${sched.error}). Aborted before posting to avoid publishing immediately.`,
+          error_code: "SCHEDULE_FAILED",
+          data: diag as any,
+        };
+      }
+      console.error(`[tiktok] native schedule applied for ${req.schedule_at}`);
+    }
+
+    if (req.privacy === 1 || req.privacy === 2) {
+      const pr = await setPrivacy(page, req.privacy);
+      if (!pr.ok) {
+        const diag = await captureUiState(page, "photo-privacy-set-failed");
+        return {
+          success: false,
+          error: `Could not set audience to ${req.privacy === 2 ? "Only you" : "Friends"} (control showed "${pr.value || pr.error}"). Aborted before posting.`,
+          error_code: "INVALID_INPUT",
+          data: diag as any,
+        };
+      }
+    }
+    if (req.allow_comments === false) {
+      await page.locator('[data-e2e="upload-switch-comment"], label:has-text("Comment")').first()
+        .click({ timeout: 2000 }).catch(() => {});
+    }
+    if (req.allow_duet === false) {
+      await page.locator('[data-e2e="upload-switch-duet"], label:has-text("Duet")').first()
+        .click({ timeout: 2000 }).catch(() => {});
+    }
+    if (req.allow_stitch === false) {
+      await page.locator('[data-e2e="upload-switch-stitch"], label:has-text("Stitch")').first()
+        .click({ timeout: 2000 }).catch(() => {});
+    }
+
+    await dismissBlockingModal(page);
+
+    const post = await resolveElement(page, [
+      { name: "data-e2e", build: (p) => p.locator('[data-e2e="post_video_button"]') },
+      { name: "role-name", build: (p) => p.getByRole("button", { name: /^(post|schedule)$/i }) },
+      { name: "text", build: (p) => p.locator('button:has-text("Schedule"), button:has-text("Post")') },
+    ], { perStrategyMs: 8000 });
+    if (!post) {
+      const diag = await captureUiState(page, "photo-post-button-missing");
+      return {
+        success: false,
+        error: "Submit button not found — the editor may not be ready, or the selector rotated.",
+        error_code: "UI_TIMEOUT",
+        data: diag as any,
+      };
+    }
+    console.error(`[tiktok] photo submit button resolved via ${post.strategy}`);
+
+    const result = await submitAndAwaitTikTokApi(
+      page,
+      async () => { await post.locator.click({ timeout: 10000 }); },
+      /\/aweme\/v\d+\/(web\/)?aweme\/post/,
+      60000,
+    );
+
+    if (!result) {
+      const url = String(page.url());
+      const posted = /tiktokstudio\/(content|posts)/i.test(url)
+        || await page.locator('text=/your (video|post).*(posted|uploaded|scheduled|published)|posted successfully|scheduled successfully/i')
+             .first().isVisible({ timeout: 3000 }).catch(() => false);
+      if (posted) {
+        recordAction(req.account_id, "tiktok", "post");
+        console.error(`[tiktok] photo post confirmed via redirect/toast (url=${url})`);
+        const resolved = await findPostedVideo(page, req.caption).catch(() => undefined);
+        const found = resolved?.matched === "caption"
+          ? { video_url: resolved.video_url, video_id: resolved.video_id }
+          : undefined;
+        return {
+          success: true,
+          data: {
+            ...(found || {}),
+            ...(req.schedule_at ? { scheduled_at: req.schedule_at, pending_publish: true } : {}),
+          },
+        };
+      }
+      const diag = await captureUiState(page, "photo-no-post-api");
+      return {
+        success: false,
+        error: "No post confirmation observed after clicking Post — UI flow may have changed.",
+        error_code: "UI_TIMEOUT",
+        data: diag as any,
+      };
+    }
+
+    if (!result.ok) {
+      return {
+        success: false,
+        error: result.errorMessage || `TikTok returned HTTP ${result.status}`,
+        error_code: mapTikTokError(result.status, result.statusCode),
+      };
+    }
+
+    recordAction(req.account_id, "tiktok", "post");
+    const aweme = result.json?.aweme || result.json?.data || {};
+    return {
+      success: true,
+      data: {
+        video_id: aweme.aweme_id || aweme.id,
+        video_url: aweme.share_url || aweme.video_url,
+        ...(req.schedule_at ? { scheduled_at: req.schedule_at } : {}),
+      },
+    };
+  } catch (e: any) {
+    const diag = await captureUiState(page, "photo-post-unknown-error").catch(() => ({}));
+    return { success: false, error: e.message || String(e), error_code: "UNKNOWN", data: diag as any };
+  } finally {
+    imagePaths = [];
+    cleaned.forEach((c) => { try { c(); } catch {} });
+    await close();
+  }
+}
+

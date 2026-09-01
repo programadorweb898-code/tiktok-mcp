@@ -11,6 +11,7 @@ import {
   monetizationStatus,
   pinVideo,
   playlistManage,
+  postPhotoFeed,
   postVideo,
   profileAnalyticsFeed,
   searchByType,
@@ -268,6 +269,10 @@ export class LocalTikTokRuntime {
 
   post(input: Record<string, any>) {
     return this.start("post", input.account_id, input, (common) => postVideo({ ...common, ...input } as any));
+  }
+
+  photoPost(input: Record<string, any>) {
+    return this.start("photoPost", input.account_id, input, (common) => postPhotoFeed({ ...common, ...input } as any));
   }
 
   /**
