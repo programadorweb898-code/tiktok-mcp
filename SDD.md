@@ -23,6 +23,7 @@ El sistema combina: MCP (stdio), Playwright con perfiles de navegador persistent
 | `ffmpeg-static` (agregada) | npm | Binario estático de ffmpeg (6.1.1) para fusión local de media (`tiktok_mix_media`); no requiere instalación externa |
 | `zod` ^3.25 | npm | Validación de parámetros de tools |
 | Relay QR (`tiktok.palmyr.ai`, configurable vía `TIKTOK_CONNECT_RELAY_URL`) | servicio externo efímero | Único servicio externo: entrega del QR al humano durante el login. No almacena credenciales; solo retransmite la imagen del QR. HTTPS obligatorio salvo localhost |
+| LLM externo (solo para el modo `--telegram-bot`) | servicio externo opcional | Razona las instrucciones de Telegram y elige qué tool ejecutar. Cualquier endpoint OpenAI-compatible (`OPENAI_API_KEY` + `OPENAI_BASE_URL`, ej. OpenAI, Ollama, vLLM). No se usa en el modo MCP stdio. |
 
 **No se usa ninguna API oficial de TikTok en el código actual.** Todas las capacidades implementadas son browser automation.
 
@@ -69,8 +70,12 @@ TikTok (web + TikTok Studio)
 
 | Archivo | Responsabilidad |
 |---|---|
-| `src/index.ts` | Entrypoint binario (`tiktok-mcp`). Flags: `--data-dir`, `--browser-path`, `--headless`. Transporte stdio. |
+| `src/index.ts` | Entrypoint binario (`tiktok-mcp`). Flags: `--data-dir`, `--browser-path`, `--headless`, y `--telegram-bot` (arranca el orquestador de Telegram en lugar del MCP stdio). |
 | `src/server.ts` | Registro de las 38 tools con esquemas zod, wrapper `addTool` con captura de errores y devolución estructurada (`structuredContent` + texto JSON). |
+| `src/runtime/telegram.ts` | Cliente mínimo del Bot API de Telegram (`sendMessage`, `getUpdates` con offset/timeout de long-polling). Nunca hard-codea credenciales; token desde `TELEGRAM_BOT_TOKEN`. |
+| `src/runtime/llm-client.ts` | Cliente LLM agnóstico OpenAI-compatible (`/chat/completions`): razona la instrucción y elige tool. Acepta `OPENAI_API_KEY` + `OPENAI_BASE_URL` + `TELEGRAM_BOT_MODEL`. |
+| `src/runtime/tool-catalog.ts` | Catálogo declarativo de tools de TikTok para el orquestador (nombre, resumen, params) + dispatch al método correspondiente del runtime. Independiente del stdio MCP. |
+| `src/runtime/telegram-bot.ts` | Orquestador de Telegram: long-polling de `getUpdates`, autorización por chat (`TELEGRAM_CHAT_ID`/`TELEGRAM_ALLOWED_CHATS`), razonamiento con LLM, ejecución de tool sobre el runtime y respuesta por `sendMessage`. |
 | `src/runtime/local-runtime.ts` | Orquestador. Crea operaciones asíncronas (`pending → running → done/failed/cancelled`), gestiona el flujo de conexión QR, delega en las operaciones. |
 | `src/runtime/tiktok-operations.ts` | Implementación real de cada operación contra TikTok: subida de video, follow, like, delete, perfil, avatar, scraping de analíticas. Incluye helpers de diagnóstico, modales, privacidad, scheduling nativo e interceptor de respuestas API. |
 | `src/runtime/media-mix.ts` | Fusión local de media con `ffmpeg-static` (binario incluido): reemplaza o superpone una pista de audio sobre un video y produce un MP4 listo para `tiktok_post`. |
@@ -91,6 +96,7 @@ TikTok (web + TikTok Studio)
 | `src/tests/local.test.ts` | Tests con `node:test`. |
 | `src/tests/op-validators.test.ts` | Tests unitarios de los validadores puros (`normalizeHandle`, `isValidHandle`, `isValidVideoPermalink`, `mapTikTokError`). Sin navegador. |
 | `src/tests/social-selectors.test.ts` | Tests unitarios de la capa de estabilización (`resolveElement`, `waitForHydrated`, `axSnapshot`) con page mock, sin Chromium. |
+| `src/tests/telegram-bot.test.ts` | Tests del razonamiento del orquestador de Telegram (decisión de tool → dispatch al runtime → resumen; respuesta texto directo; tool desconocida; falta de config de LLM) con `fetch`/LLM inyectados y runtime fake, sin Telegram real ni navegador. |
 
 ### Modelo de ejecución
 
@@ -682,6 +688,25 @@ Decisión: implementar `tiktok_photo_post`, que publica (o programa con el sched
 Motivo: cerrar la capacidad "photo (carrusel)" de la Fase 6 (roadmap), que estaba en `PLANNED`. El usuario eligió photo post sobre draft/edición/APIs oficiales.
 Alternativas consideradas: drafts (RESEARCH, flujo incierto en web); edición de posts publicados (NOT_SUPPORTED en la web de TikTok); APIs oficiales (requieren claves y contradicen la arquitectura self-hosted sin credenciales).
 Consecuencias: una tool nueva con job async vía `this.start` (como `postVideo`). La herramienta no inventa éxito: si el paso de edición del carrusel (superficie entre upload y caption, no inspeccionada en desarrollo) bloquea, reporta `UPLOAD_FAILED` con diagnóstico; el avance por ese paso es defensivo (botón next/edit por texto visible). Conteo pasa de 37 a 38 tools. Validación manual pendiente contra una cuenta real autenticada.
+
+---
+
+## DEC-025 — Orquestador de Telegram (`--telegram-bot`)
+
+Fecha: 2026-09-03
+
+Estado: Aceptada (implementada v1; requiere una cuenta real de Telegram + clave de LLM para validación manual)
+
+Decisión: agregar un modo `--telegram-bot` al binario que escuche instrucciones de Telegram (long-polling de `getUpdates`), las pase a un LLM OpenAI-compatible para que decida qué tool de TikTok ejecutar, ejecute esa tool sobre `LocalTikTokRuntime` directamente (sin stdio), y responda por `sendMessage` en el mismo chat. El catálogo de tools del bot (`src/runtime/tool-catalog.ts`) es declarativo e independiente del layer MCP stdio, por lo que no se refactorizó `src/server.ts` ni se rompió ninguna de las 38 tools existentes.
+Motivo: el usuario pidió "conectar el MCP de TikTok a Telegram para que el agente actúe al recibir instrucciones y responda por Telegram". Como un MCP server solo expone tools y no razona solo, se eligió un bot orquestador con LLM propio (opción elegida explícitamente por el usuario) en lugar de un simple puente Telegram↔cliente MCP.
+Alternativas consideradas: puente Telegram↔cliente MCP externo (depende de que el cliente esté activo y no agrega razonamiento); escuchar y notificar sin LLM (no "actúa"). 
+Consecuencias:
+- LLM agnóstico vía `OPENAI_API_KEY` + `OPENAI_BASE_URL` (OpenAI, Ollama, vLLM, etc.) y `TELEGRAM_BOT_MODEL`. Sin clave, el bot arranca pero avisa que falta configurar el LLM.
+- Autorización por chat mediante `TELEGRAM_CHAT_ID` (o lista) / `TELEGRAM_ALLOWED_CHATS`; si no se configura ninguna, responde a cualquier chat.
+- El bot expone un subconjunto de tools de acción y lectura (post, photo_post, follow, unfollow, like, unlike, comment, comment_reply, comments, delete, profile, profile_analytics, studio_analytics, series, scheduled, operation_status, search, trending, accounts).
+- No se guardan credenciales: token bot y clave LLM vienen de variables de entorno.
+- Nueva capa testeada con `fetch`/LLM inyectados y un runtime fake (sin navegador ni red real) en `src/tests/telegram-bot.test.ts`.
+- Capacidad sin relación con el canal MCP stdio: el conteo de tools (38) no cambia; validación manual pendiente contra un bot real y una cuenta de TikTok autenticada.
 
 ---
 

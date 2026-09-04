@@ -58,10 +58,14 @@ export class TelegramClient {
     return payload;
   }
 
-  async getUpdates(): Promise<TelegramMessage[]> {
-    const response = await this.fetchImpl(this.endpoint("getUpdates"), {
+  async getUpdates(offset?: number, timeoutMs = 0): Promise<TelegramMessage[]> {
+    const params = new URLSearchParams();
+    if (offset) params.set("offset", String(offset));
+    if (timeoutMs > 0) params.set("timeout", String(Math.floor(timeoutMs / 1000)));
+    const query = params.toString();
+    const response = await this.fetchImpl(`${this.endpoint("getUpdates")}${query ? `?${query}` : ""}`, {
       method: "GET",
-      signal: AbortSignal.timeout(this.timeoutMs),
+      signal: AbortSignal.timeout(this.timeoutMs + Math.max(timeoutMs, 0)),
     });
     const payload = await response.json().catch(() => ({})) as { ok?: boolean; result?: TelegramMessage[]; error?: string };
     if (!response.ok) throw new Error(payload.error || `Telegram returned HTTP ${response.status}`);

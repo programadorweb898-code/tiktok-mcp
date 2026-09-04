@@ -99,7 +99,36 @@ On a Linux VPS without a desktop display, install Xvfb so TikTok receives a head
 sudo apt-get install -y xvfb
 ```
 
+## Telegram bot orchestrator
 
+Besides working as an MCP server over stdio, the same binary can run as a
+**Telegram bot** that listens for instructions on Telegram, uses an LLM to
+decide which TikTok tool to run, executes it locally, and replies on the same
+chat.
+
+```bash
+TELEGRAM_BOT_TOKEN=123:ABC \
+TELEGRAM_CHAT_ID=987654321 \
+OPENAI_API_KEY=sk-... \
+tiktok-mcp --telegram-bot
+```
+
+Configuration (all optional except the token and the LLM key):
+
+| Setting                  | Description                                              |
+| ------------------------ | -------------------------------------------------------- |
+| `TELEGRAM_BOT_TOKEN`     | **Required.** Bot token from BotFather.                  |
+| `OPENAI_API_KEY`         | **Required** for the reasoning LLM.                      |
+| `TELEGRAM_CHAT_ID`       | Allow a single chat (or comma-separated list).           |
+| `TELEGRAM_ALLOWED_CHATS` | Comma-separated chat ids; overrides `TELEGRAM_CHAT_ID`.  |
+| `OPENAI_BASE_URL`        | Any OpenAI-compatible endpoint (OpenAI, Ollama, vLLM...).|
+| `TELEGRAM_BOT_MODEL`     | LLM model (default `gpt-4o-mini`).                       |
+
+If no chat is authorized, the bot answers any chat. The bot exposes a subset of
+the TikTok tools (`post`, `photo_post`, `follow`, `unfollow`, `like`, `unlike`,
+`comment`, `comment_reply`, `comments`, `delete`, `profile`,
+`profile_analytics`, `studio_analytics`, `series`, `scheduled`,
+`operation_status`, `search`, `trending`, `accounts`).
 
 ## Hosted HTTP API
 
