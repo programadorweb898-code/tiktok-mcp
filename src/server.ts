@@ -388,6 +388,26 @@ export function createTikTokServer(options: TikTokServerOptions = {}): McpServer
     inputSchema: { account_id: ACCOUNT_ID },
   }, (args) => runtime.profileAnalytics(args as any));
 
+  addTool(server, "tiktok_following", {
+    title: "List accounts the user follows",
+    description: "Read the account's own Following list (nav → /following): display name, handle and profile URL per followed user, in TikTok's own order (most recently followed first). Rooted on data-e2e cards, so no handle is needed. Optionally read more than the 5-card preview by expanding 'View all'. With mode='oldest' it scrolls the whole list to report who was followed the longest ago. Read-only; reports NOT_READY if the list never renders.",
+    inputSchema: {
+      account_id: ACCOUNT_ID,
+      limit: z.number().int().min(1).max(30).optional().describe("Max followed users to return (default 10)"),
+      mode: z.enum(["newest", "oldest"]).optional().describe("'newest' (default) returns the most recently followed; 'oldest' walks the whole list and returns the oldest"),
+    },
+  }, (args) => runtime.following(args as any));
+
+  addTool(server, "tiktok_followers", {
+    title: "List accounts that follow the user",
+    description: "Read the account's own Followers list by opening the Followers dialog on the profile: display name, handle and profile URL per follower. Accepts an optional `search` substring (e.g. a handle) to answer 'does X follow me?', returning `found` plus the matching followers. Read-only; reports NOT_READY if the dialog never renders.",
+    inputSchema: {
+      account_id: ACCOUNT_ID,
+      limit: z.number().int().min(1).max(100).optional().describe("Max followers to return (default 10)"),
+      search: z.string().optional().describe("Substring of handle or display name to look for among followers"),
+    },
+  }, (args) => runtime.followers(args as any));
+
   addTool(server, "tiktok_studio_analytics", {
     title: "Read TikTok Studio analytics overview",
     description: "Read TikTok Studio's analytics overview in a defensive best-effort way, extracting visible label/value pairs (Views, Watch time, Followers, Likes, Comments, etc.). Never guesses a metric that isn't visibly present; reports NOT_READY if nothing renders.",

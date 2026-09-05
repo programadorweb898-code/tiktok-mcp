@@ -40,13 +40,19 @@ test("telegram bot: tool decision dispatches to runtime and summarizes", async (
   const fakeRuntime = {
     follow: async ({ account_id, target_user }: any) => {
       ran = `${account_id}:${target_user}`;
-      return { success: true, operation_id: "op-1", status: "pending" };
+      return { operation_id: "op-1", status: "pending" };
     },
+    operationStatus: () => ({
+      operation_id: "op-1",
+      status: "done",
+      result: { success: true },
+    }),
   } as unknown as LocalTikTokRuntime;
 
   const bot = new TelegramBot(fakeRuntime, {
     token: "test-token",
     allowedChats: ["123"],
+    operationPollMs: 1,
     llm: stubLlm([
       { toolCall: { name: "tiktok_follow", arguments: { account_id: "brand", target_user: "@x" } } },
       { text: "Listo, empece a seguir a @x en la cuenta brand." },
@@ -56,6 +62,34 @@ test("telegram bot: tool decision dispatches to runtime and summarizes", async (
   const reply = await bot.processInstruction("Seguí a @x desde la cuenta brand", 123);
   assert.equal(ran, "brand:@x");
   assert.match(reply, /@x/);
+});
+
+test("telegram bot: pending async operations are awaited and reported with the final result", async () => {
+  let polls = 0;
+  const fakeRuntime = {
+    profileAnalytics: async () => ({ operation_id: "op-9", status: "pending" }),
+    operationStatus: () => {
+      polls += 1;
+      if (polls < 2) return { operation_id: "op-9", status: "running", done: false };
+      return { operation_id: "op-9", status: "done", done: true, result: { profile: { counts: { following: 42 } } } };
+    },
+  } as unknown as LocalTikTokRuntime;
+
+  const bot = new TelegramBot(fakeRuntime, {
+    token: "test-token",
+    allowedChats: ["123"],
+    operationPollMs: 1,
+    llm: stubLlm([
+      {
+        toolCall: { name: "tiktok_profile_analytics", arguments: { account_id: "brand" } },
+      },
+      { text: "El perfil de brand tiene 42 seguidos." },
+    ]),
+  });
+
+  const reply = await bot.processInstruction("A cuantas personas sigo", 123);
+  assert.equal(polls, 2);
+  assert.match(reply, /42/);
 });
 
 test("telegram bot: text-only reply when no tool is needed", async () => {

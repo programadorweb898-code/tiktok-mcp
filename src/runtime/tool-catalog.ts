@@ -142,9 +142,29 @@ export const TOOL_CATALOG: CatalogTool[] = [
   },
   {
     name: "tiktok_profile_analytics",
-    summary: "Read the account's own public profile header (followers, likes, videos totals).",
-    params: [p("account_id", "string", "Local account name", true)],
-    run: (r, a) => r.profileAnalytics({ account_id: a.account_id }),
+    summary: "Read the account's public profile header counters: followers, following (cuantas personas sigue), likes and videos totals.",
+    params: [p("account_id", "string", "Local account name (omite si hay una sola cuenta)")],
+    run: async (r, a) => r.profileAnalytics({ account_id: await resolveAccountId(r, a.account_id) }),
+  },
+  {
+    name: "tiktok_following",
+    summary: "Lista las cuentas que sigues (Following), del más reciente al más antiguo según el orden de TikTok; devuelve display name, @handle y URL por usuario. El primer item es la persona que seguiste más recientemente. Con mode='oldest' recorre toda la lista y devuelve las cuentas más antiguas (quien seguiste hace más tiempo).",
+    params: [
+      p("account_id", "string", "Local account name (omite si hay una sola cuenta)"),
+      p("limit", "number", "Cuantas cuentas devolver (default 10, max 30)"),
+      p("mode", "string", "'newest' (default) o 'oldest'"),
+    ],
+    run: async (r, a) => r.following({ account_id: await resolveAccountId(r, a.account_id), limit: a.limit, mode: a.mode }),
+  },
+  {
+    name: "tiktok_followers",
+    summary: "Lista las cuentas que te siguen (Followers) abriendo el dialogo de seguidores del perfil; devuelve display name, @handle y URL por usuario. Con 'search' (subcadena del handle o nombre) responde '¿tal persona me sigue?': devuelve found y los matches.",
+    params: [
+      p("account_id", "string", "Local account name (omite si hay una sola cuenta)"),
+      p("limit", "number", "Cuantos seguidores devolver (default 10, max 100)"),
+      p("search", "string", "Subcadena de handle o nombre a buscar entre los seguidores"),
+    ],
+    run: async (r, a) => r.followers({ account_id: await resolveAccountId(r, a.account_id), limit: a.limit, search: a.search }),
   },
   {
     name: "tiktok_studio_analytics",
@@ -195,7 +215,18 @@ export function catalogByName(): Map<string, CatalogTool> {
 
 export function catalogForPrompt(): string {
   return TOOL_CATALOG.map((t) => {
-    const params = t.params.map((x) => `${x.name}${x.required ? "*" : ""}:${x.type} — ${x.description}`).join("\n    ");
+    const params = t.params.map((x) => `${x.name}${x.required ? "*" : ":${x.type}"} — ${x.description}`).join("\n    ");
     return `- ${t.name}: ${t.summary}\n    ${params || "(no params)"}`;
   }).join("\n");
+}
+
+async function resolveAccountId(runtime: LocalTikTokRuntime, accountId?: string): Promise<string> {
+  if (accountId) return accountId;
+  const list = await runtime.accounts();
+  const accounts = Array.isArray(list) ? list : (list as any).accounts;
+  if (Array.isArray(accounts) && accounts.length === 1) return accounts[0].id;
+  if (Array.isArray(accounts) && accounts.length > 1) {
+    throw new Error(`Multiple local accounts (${accounts.map((a) => a.id).join(", ")}); pass account_id.`);
+  }
+  throw new Error("No local TikTok account connected; call tiktok_connect first.");
 }

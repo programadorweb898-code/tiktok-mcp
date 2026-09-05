@@ -47,6 +47,7 @@ export interface TelegramBotOptions {
   token?: string;
   allowedChats?: string[];
   pollMs?: number;
+  operationPollMs?: number;
   fetchImpl?: typeof fetch;
   llm?: LlmClient;
   shouldRun?: (msg: TelegramMessage) => boolean;
@@ -56,6 +57,7 @@ export class TelegramBot {
   private readonly client: TelegramClient;
   private readonly allowed: Set<string>;
   private readonly pollMs: number;
+  private readonly operationPollMs: number;
   private readonly catalog = catalogByName();
   private readonly llm: LlmClient | null;
   private offset = 0;
@@ -73,6 +75,7 @@ export class TelegramBot {
       ? new Set(options.allowedChats.map((s) => String(s)))
       : allowedChatSet();
     this.pollMs = options.pollMs ?? (Number(process.env.TELEGRAM_BOT_POLL_MS) || 1500);
+    this.operationPollMs = options.operationPollMs ?? 2_500;
     this.llm = options.llm ?? (llmConfigFromEnv() ? new LlmClient(llmConfigFromEnv()!) : null);
     this.runFilter = options.shouldRun;
   }
@@ -164,10 +167,45 @@ export class TelegramBot {
     if (!tool) return `Herramienta desconocida: ${name}`;
     try {
       const result = await tool.run(this.runtime, args || {});
+      const pendingOp =
+        result && typeof result === "object" && (result as any).operation_id && (result as any).status === "pending"
+          ? (result as any).operation_id
+          : null;
+      if (pendingOp) {
+        return JSON.stringify(await this.awaitOperation(pendingOp), null, 2);
+      }
       return JSON.stringify(result, null, 2);
     } catch (error) {
       return JSON.stringify({ error: true, message: error instanceof Error ? error.message : String(error) });
     }
+  }
+
+  /**
+   * Poll an async TikTok operation until it finishes so the bot answers with
+   * the real result instead of pointing the user at tiktok_operation_status.
+   * Long-lived operations (e.g. connect, waiting on a QR scan) time out and
+   * report that they are still pending.
+   */
+  private async awaitOperation(operationId: string, timeoutMs = 90_000): Promise<Record<string, unknown>> {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      await this.delay(this.operationPollMs);
+      const status = this.runtime.operationStatus(operationId) as any;
+      if (status.done) {
+        return {
+          operation_id: operationId,
+          status: status.status,
+          ...(status.result !== undefined ? { result: status.result } : {}),
+          ...(status.error !== undefined ? { error: status.error } : {}),
+          ...(status.error_code !== undefined ? { error_code: status.error_code } : {}),
+        };
+      }
+    }
+    return {
+      operation_id: operationId,
+      status: "pending",
+      note: "La operacion sigue en curso. Podes consultar su estado más tarde con tiktok_operation_status.",
+    };
   }
 
   private async summarize(instruction: string, toolName: string, outcome: string): Promise<string> {
@@ -177,7 +215,7 @@ export class TelegramBot {
         "'. Se ejecuto la herramienta " + toolName + " y este fue el resultado en JSON:\n\n" +
         outcome +
         "\n\nExplica el resultado al usuario en espanol, de forma clara y concisa." +
-        " Si el resultado indica una accion asincrona (operation_id), indica que se inicio y que habria que consultar su estado.",
+        " Si el resultado trae una accion asincrona con operation_id que sigue en 'pending', indica que esta en curso y que se puede consultar su estado mas tarde.",
       user: "Resume el resultado.",
       tools: [],
     };

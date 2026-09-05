@@ -2054,6 +2054,364 @@ export async function profileAnalyticsFeed(req: TikTokProfileAnalyticsRequest): 
   }
 }
 
+export interface TikTokFollowingRequest extends TikTokOpRequest {
+  /** Max number of followed users to read (default 10, cap 30). */
+  limit?: number;
+  /** "newest" (default) reads the most recently followed users; "oldest" scrolls the whole list and reads the oldest. */
+  mode?: "newest" | "oldest";
+}
+
+export interface FollowingUser {
+  display_name: string;
+  handle: string;
+  url: string;
+}
+
+/**
+ * Read the account's own Following list (the nav link `nav-following` →
+ * `/following`). TikTok renders it as a list of user cards
+ * (`a[data-e2e="following-user-button"]` with `following-user-title` /
+ * `following-user-desc`), ordered from most recently followed down; "View all"
+ * (`following-see-all`) expands the 5-item preview to the full list. Read-only;
+ * verifies by read-back that at least one card rendered, else NOT_READY.
+ */
+export async function followingFeed(req: TikTokFollowingRequest): Promise<TikTokOpResult<{ following: FollowingUser[]; total?: number; mode: "newest" | "oldest"; first_handle?: string; oldest_handle?: string; scraped_at: string }>> {
+  const blocked = gate(req.account_id, "following");
+  if (blocked) return blocked;
+  const mode = req.mode === "oldest" ? ("oldest" as const) : ("newest" as const);
+
+  let session;
+  try {
+    session = await openAuthenticatedSession({
+      accountId: req.account_id,
+      proxySessionId: req.proxy_session_id,
+      cookies: req.cookies,
+      country: req.country,
+    });
+  } catch (e: any) {
+    return { success: false, error: `Failed to open session: ${e.message}`, error_code: "LAUNCH_FAILED" };
+  }
+
+  const { page, close } = session;
+  try {
+    const target = Math.min(Math.max(Number(req.limit) || 10, 1), 30);
+
+    const loadList = async () => {
+      await page.goto("https://www.tiktok.com/following", { waitUntil: "domcontentloaded", timeout: 45000 }).catch(() => {});
+      return waitForHydrated(
+        page,
+        { label: "following-list", predicate: `(() => document.querySelectorAll('a[data-e2e="following-user-button"]').length > 0 ? 'rendered' : null)()` },
+        { timeoutMs: 25000 },
+      );
+    };
+
+    let rendered = await loadList();
+    if (!rendered) {
+      // TikTok can transiently serve an error/navigational drop on first load
+      // (chrome-error or "Something went wrong"); retry via a safe page.
+      for (let attempt = 0; attempt < 2 && !rendered; attempt++) {
+        await page.goto("https://www.tiktok.com/foryou", { waitUntil: "domcontentloaded", timeout: 45000 }).catch(() => {});
+        await page.waitForTimeout(3000);
+        rendered = await loadList();
+      }
+    }
+    if (!rendered) {
+      const diag = await captureUiState(page, "following-not-rendered");
+      return { success: false, error: "The Following list never rendered any followed-user cards, so no following data was read.", error_code: "NOT_READY", data: diag as any };
+    }
+
+    // Expand the preview to the full list when the caller wants more than 5,
+    // or when we need to walk to the oldest entries.
+    const seeAll = page.locator('button[data-e2e="following-see-all"]').first();
+    if ((mode === "oldest" || target > 5) && (await seeAll.isVisible({ timeout: 4000 }).catch(() => false))) {
+      await seeAll.click({ timeout: 8000 }).catch(() => {});
+      await page.waitForTimeout(2000);
+      // Lazy-loaded list. For "newest" scroll a few rounds until enough cards
+      // are present; for "oldest" keep scrolling the real container until the
+      // list stops growing, then walk backwards.
+      const continueScroll = async () => {
+        await page.evaluate(`(() => {
+          window.scrollBy(0, 900);
+          const el = [...document.querySelectorAll('div')].find((d) => !!d.querySelector('a[data-e2e="following-user-button"]') && d.scrollHeight > d.clientHeight + 10);
+          if (el) el.scrollTop = el.scrollHeight;
+        })()`).catch(() => {});
+      };
+      let prev = 0;
+      let stable = 0;
+      const rounds = mode === "oldest" ? 80 : 6;
+      for (let i = 0; i < rounds; i++) {
+        const count = await page.locator('a[data-e2e="following-user-button"]').count().catch(() => 0);
+        if (mode !== "oldest" && count >= target) break;
+        if (count === prev) {
+          stable++;
+          if (mode === "oldest" && stable >= 5) break;
+        } else {
+          stable = 0;
+        }
+        prev = count;
+        await continueScroll();
+        await page.waitForTimeout(1300);
+      }
+    }
+
+    const anchors = page.locator('a[data-e2e="following-user-button"]');
+    const anchorCount = await anchors.count().catch(() => 0);
+    if (anchorCount === 0) {
+      const diag = await captureUiState(page, "following-scrape-failed");
+      return { success: false, error: "Could not read the Following list (no followed-user cards rendered).", error_code: "UI_TIMEOUT", data: diag as any };
+    }
+
+    const following: FollowingUser[] = [];
+    const seen = new Set<string>();
+    for (let i = 0; i < anchorCount; i++) {
+      const a = anchors.nth(i);
+      const href = ((await a.getAttribute("href").catch(() => null)) || "").trim();
+      if (!href.includes("/@")) continue;
+      const url = href.startsWith("http") ? href : "https://www.tiktok.com" + href;
+      const descEl = a.locator('[data-e2e="following-user-desc"]');
+      const titleEl = a.locator('[data-e2e="following-user-title"]');
+      const handle = (
+        ((await descEl.count().catch(() => 0)) > 0 ? ((await descEl.textContent().catch(() => "")) ?? "").trim() : "") ||
+        (href.split("/@")[1]?.split(/[/?#]/)[0] || "")
+      ).trim();
+      const key = url + "|" + handle;
+      if (seen.has(key) || !handle) continue;
+      seen.add(key);
+      const displayName = (
+        (((await titleEl.count().catch(() => 0)) > 0 ? ((await titleEl.textContent().catch(() => "")) ?? "").trim() : "") ||
+          ((await a.textContent().catch(() => "")) ?? "")) as string
+      ).replace(handle, "").replace(/\s+/g, " ").trim().slice(0, 60);
+      following.push({ display_name: displayName || handle, handle, url });
+    }
+
+    let total: number | null = null;
+    const countEl = page.locator('strong[data-e2e="following-count"]').first();
+    if ((await countEl.count().catch(() => 0)) > 0) {
+      const raw = ((await countEl.textContent().catch(() => "")) ?? "").trim().replace(/,/g, "");
+      const m = raw.match(/^([\d.]+)\s*([KMB])?$/i);
+      if (m) {
+        let n = parseFloat(m[1]);
+        const u = (m[2] || "").toUpperCase();
+        if (u === "K") n *= 1e3; else if (u === "M") n *= 1e6; else if (u === "B") n *= 1e9;
+        total = Math.round(n);
+      }
+    }
+
+    if (following.length === 0) {
+      console.error("[tiktok] following got anchors:", anchorCount);
+      const diag = await captureUiState(page, "following-scrape-failed");
+      return { success: false, error: "Could not read the Following list (no followed-user cards parsed).", error_code: "UI_TIMEOUT", data: diag as any };
+    }
+
+    return {
+      success: true,
+      data: {
+        mode,
+        following: mode === "oldest" ? following.slice(-target).reverse() : following.slice(0, target),
+        ...(total != null ? { total } : {}),
+        ...(mode === "oldest"
+          ? { oldest_handle: following[following.length - 1]?.handle }
+          : { first_handle: following[0]?.handle }),
+        scraped_at: new Date().toISOString(),
+      },
+    };
+  } catch (e: any) {
+    const diag = await captureUiState(page, "following-error").catch(() => ({}));
+    return { success: false, error: e.message || String(e), error_code: "UNKNOWN", data: diag as any };
+  } finally {
+    await close();
+  }
+}
+
+export interface TikTokFollowersRequest extends TikTokOpRequest {
+  /** Max number of followers to read (default 10, cap 100). */
+  limit?: number;
+  /** Optional handle/substring to find in the loaded follower list; returns `found` and `matches`. */
+  search?: string;
+}
+
+export interface FollowersResult {
+  followers: FollowingUser[];
+  total?: number;
+  search?: string;
+  found?: boolean;
+  matches: FollowingUser[];
+  scraped_at: string;
+}
+
+/**
+ * Read the account's own Followers list. The followers list only opens from the
+ * profile page: clicking the `[data-e2e="followers"]` tab shows a dialog whose
+ * rows are `a[href*="/@"]` anchors (with `*[data-e2e*="title"]` names). Scans
+ * the dialog (scrolls the inner container until the list stops growing) and
+ * optionally filters it for `search`. Read-only; verifies by read-back that the
+ * dialog rendered follower rows, else NOT_READY.
+ */
+export async function followersFeed(req: TikTokFollowersRequest): Promise<TikTokOpResult<FollowersResult>> {
+  const blocked = gate(req.account_id, "followers");
+  if (blocked) return blocked;
+
+  let session;
+  try {
+    session = await openAuthenticatedSession({
+      accountId: req.account_id,
+      proxySessionId: req.proxy_session_id,
+      cookies: req.cookies,
+      country: req.country,
+    });
+  } catch (e: any) {
+    return { success: false, error: `Failed to open session: ${e.message}`, error_code: "LAUNCH_FAILED" };
+  }
+
+  const { page, close } = session;
+  try {
+    const target = Math.min(Math.max(Number(req.limit) || 10, 1), 100);
+    const search = (req.search || "").trim().toLowerCase();
+
+    const ownUrl = await resolveOwnProfileUrl(page);
+    if (!ownUrl) {
+      const diag = await captureUiState(page, "followers-no-nav");
+      return { success: false, error: "Could not resolve the account's own profile URL from the nav.", error_code: "NOT_READY", data: diag as any };
+    }
+
+    const loadProfile = async () => {
+      await page.goto(ownUrl, { waitUntil: "domcontentloaded", timeout: 45000 }).catch(() => {});
+      return waitForHydrated(
+        page,
+        { label: "followers-header", predicate: `(() => document.querySelector('strong[data-e2e="followers-count"]') ? 'rendered' : null)()` },
+        { timeoutMs: 25000 },
+      );
+    };
+
+    let rendered = await loadProfile();
+    if (!rendered) {
+      for (let attempt = 0; attempt < 3 && !rendered; attempt++) {
+        await page.goto("https://www.tiktok.com/foryou", { waitUntil: "domcontentloaded", timeout: 45000 }).catch(() => {});
+        await page.waitForTimeout(6000);
+        rendered = await loadProfile();
+      }
+    }
+    if (!rendered) {
+      const diag = await captureUiState(page, "followers-not-rendered");
+      return { success: false, error: "The profile header never rendered its followers counter, so no followers data was read.", error_code: "NOT_READY", data: diag as any };
+    }
+
+    const tab = page.locator('[data-e2e="followers"]').first();
+    if (await tab.isVisible({ timeout: 5000 }).catch(() => false)) {
+      await tab.click({ timeout: 8000 }).catch(() => {});
+      await page.waitForTimeout(2500);
+    }
+
+    const dialogReady = await waitForHydrated(
+      page,
+      {
+        label: "followers-modal",
+        predicate: `(() => { const m = document.querySelector('[role="dialog"]'); return m && m.querySelectorAll('a[href*="/@"]').length > 0 ? 'rendered' : null; })()`,
+      },
+      { timeoutMs: 20000 },
+    );
+    if (!dialogReady) {
+      const diag = await captureUiState(page, "followers-modal-not-opened");
+      return { success: false, error: "The Followers dialog never opened its list of follower rows.", error_code: "NOT_READY", data: diag as any };
+    }
+
+    const rowLoc = page.locator('[role="dialog"] a[href*="/@"]');
+    const scrollDialog = async () => {
+      await page.evaluate(`(() => {
+        const m = document.querySelector('[role="dialog"]');
+        if (m) {
+          const el = [...m.querySelectorAll('div')].find((d) => !!d.querySelector('a[href*="/@"]') && d.scrollHeight > d.clientHeight + 10);
+          if (el) el.scrollTop = el.scrollHeight;
+        }
+        window.scrollBy(0, 900);
+      })()`).catch(() => {});
+    };
+
+    let prev = 0;
+    let stable = 0;
+    for (let i = 0; i < 80; i++) {
+      const count = await rowLoc.count().catch(() => 0);
+      if (count === prev) {
+        stable++;
+        if (stable >= 5) break;
+      } else {
+        stable = 0;
+      }
+      prev = count;
+      await scrollDialog();
+      await page.waitForTimeout(1300);
+    }
+
+    const rowCount = await rowLoc.count().catch(() => 0);
+    if (rowCount === 0) {
+      const diag = await captureUiState(page, "followers-scrape-failed");
+      return { success: false, error: "Could not read the Followers list (no follower rows rendered).", error_code: "UI_TIMEOUT", data: diag as any };
+    }
+
+    const followers: FollowingUser[] = [];
+    const seen = new Set<string>();
+    for (let i = 0; i < rowCount; i++) {
+      const a = rowLoc.nth(i);
+      const href = ((await a.getAttribute("href").catch(() => null)) || "").trim();
+      if (!href.includes("/@")) continue;
+      const handle = href.split("/@")[1]?.split(/[/?#]/)[0] || "";
+      const url = "https://www.tiktok.com/@" + handle;
+      const key = url;
+      if (seen.has(key) || !handle) continue;
+      seen.add(key);
+      const titleEl = a.locator('[data-e2e*="title"]').first();
+      let name = (
+        ((await titleEl.count().catch(() => 0)) > 0 ? ((await titleEl.textContent().catch(() => "")) ?? "").trim() : "") ||
+        ((await a.textContent().catch(() => "")) ?? "")
+      );
+      const atIdx = name.indexOf("@");
+      if (atIdx >= 0) name = name.slice(0, atIdx);
+      name = name.replace(handle, "").replace(/\s+/g, " ").trim().slice(0, 60);
+      followers.push({ display_name: name || handle, handle, url });
+    }
+
+    let total: number | null = null;
+    const countEl = page.locator('strong[data-e2e="followers-count"]').first();
+    if ((await countEl.count().catch(() => 0)) > 0) {
+      const raw = ((await countEl.textContent().catch(() => "")) ?? "").trim().replace(/,/g, "");
+      const m = raw.match(/^([\d.]+)\s*([KMB])?$/i);
+      if (m) {
+        let n = parseFloat(m[1]);
+        const u = (m[2] || "").toUpperCase();
+        if (u === "K") n *= 1e3; else if (u === "M") n *= 1e6; else if (u === "B") n *= 1e9;
+        total = Math.round(n);
+      }
+    }
+
+    if (followers.length === 0) {
+      console.error("[tiktok] followers got rows:", rowCount);
+      const diag = await captureUiState(page, "followers-scrape-failed");
+      return { success: false, error: "Could not read the Followers list (no follower rows parsed).", error_code: "UI_TIMEOUT", data: diag as any };
+    }
+
+    const matches = search
+      ? followers.filter((f) => f.handle.toLowerCase().includes(search) || f.display_name.toLowerCase().includes(search))
+      : [];
+    const sliced = followers.slice(0, target);
+
+    return {
+      success: true,
+      data: {
+        followers: sliced,
+        ...(total != null ? { total } : {}),
+        ...(search ? { search: req.search!.trim(), found: matches.length > 0 } : {}),
+        matches,
+        scraped_at: new Date().toISOString(),
+      },
+    };
+  } catch (e: any) {
+    const diag = await captureUiState(page, "followers-error").catch(() => ({}));
+    return { success: false, error: e.message || String(e), error_code: "UNKNOWN", data: diag as any };
+  } finally {
+    await close();
+  }
+}
+
 export interface TikTokStudioAnalyticsRequest extends TikTokOpRequest {}
 
 /**

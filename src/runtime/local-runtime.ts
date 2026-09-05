@@ -6,6 +6,8 @@ import {
   deleteComment,
   deleteVideo,
   followUser,
+  followersFeed,
+  followingFeed,
   likeVideo,
   listComments,
   monetizationStatus,
@@ -357,6 +359,14 @@ export class LocalTikTokRuntime {
 
   profileAnalytics(input: { account_id: string }) {
     return this.start("profileAnalytics", input.account_id, input, (common) => profileAnalyticsFeed(common));
+  }
+
+  following(input: { account_id: string; limit?: number; mode?: "newest" | "oldest" }) {
+    return this.start("following", input.account_id, input, (common) => followingFeed({ ...common, ...input }));
+  }
+
+  followers(input: { account_id: string; limit?: number; search?: string }) {
+    return this.start("followers", input.account_id, input, (common) => followersFeed({ ...common, ...input }));
   }
 
   studioAnalytics(input: { account_id: string }) {

@@ -42,7 +42,7 @@ test("exposes local tools with no payment fields", async () => {
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
   try {
     const listed = await client.listTools();
-    assert.equal(listed.tools.length, 39);
+    assert.equal(listed.tools.length, 41);
     assert.ok(listed.tools.every((tool) => tool.name.startsWith("tiktok_") || tool.name === "telegram_send"));
     assert.ok(listed.tools.every((tool) => !(tool.inputSchema.properties as Record<string, unknown> | undefined)?.payment));
     const called = await client.callTool({ name: "tiktok_niches", arguments: {} });
