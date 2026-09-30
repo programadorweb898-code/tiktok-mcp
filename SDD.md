@@ -160,8 +160,8 @@ Estados: `IMPLEMENTED` · `PARTIAL` · `PLANNED` · `RESEARCH` · `BLOCKED` · `
 | profile (nombre/bio) | IMPLEMENTED | `tiktok_update_profile` |
 | avatar | IMPLEMENTED | `tiktok_update_avatar` |
 | settings | RESEARCH | Sin implementación ni investigación registrada |
-| lista de followers | RESEARCH | — |
-| lista de following | RESEARCH | — |
+| lista de followers | IMPLEMENTED | `tiktok_followers` abre el diálogo de seguidores del perfil; acepta `search` para responder "¿tal persona me sigue?"; validación manual pendiente |
+| lista de following | IMPLEMENTED | `tiktok_following` en modo `newest` (orden de TikTok) y `oldest` (recorre la lista completa); validación manual pendiente |
 | notificaciones | RESEARCH | — |
 
 ### Publishing
@@ -403,7 +403,7 @@ Estrategia definida:
 | 4 | Analytics avanzados: analíticas de perfil, métricas profundas de Studio, histórico más rico | Completada (`tiktok_profile_analytics` lee totales del perfil; `tiktok_studio_analytics` lee el overview de Studio de forma defensiva; registro en DEC-022) |
 | 5 | LIVE: descubrimiento, información e interacción | Completada (parcial): `tiktok_live_discover` lee el feed LIVE público; `tiktok_live_info` lee la room de un creador (ambos read-only, anónimos). Interacción y comentarios en LIVE fuera de alcance por ser superficies sensibles/no inspeccionadas; registro en DEC-023 |
 | 6 | Cobertura adicional: photo posts, drafts, edición de posts publicados, APIs oficiales donde apliquen | Parcial: photo posts implementado (`tiktok_photo_post`, carrusel 1-35 imagenes). Ya implementados en fases previas: `tiktok_mix_media`, `tiktok_make_quiz`, `tiktok_make_duet`, `tiktok_monetization_status`, `tiktok_comment_reply`, `tiktok_pin_video`, `tiktok_playlist_manage`. Pendientes: drafts (RESEARCH), edición de posts publicados (NOT_SUPPORTED en web), APIs oficiales (fuera de la arquitectura self-hosted sin claves); registro en DEC-024 |
-| 7 | Integración del agente con canales externos (WhatsApp/Telegram) | Planificado |
+| 7 | Integración del agente con canales externos (WhatsApp/Telegram) | Parcial: Telegram implementado (`--telegram-bot`, DEC-025) y es el único canal del usuario, con confirmación escrita para acciones destructivas (DEC-026). Voz dentro de Telegram en segunda fase. WhatsApp sigue sin soporte (FBM requiere cuenta de empresa y webhook público, fuera de la arquitectura self-hosted) |
 
 El roadmap puede modificarse; cualquier cambio relevante se registra en el Decision Log.
 
@@ -707,6 +707,31 @@ Consecuencias:
 - No se guardan credenciales: token bot y clave LLM vienen de variables de entorno.
 - Nueva capa testeada con `fetch`/LLM inyectados y un runtime fake (sin navegador ni red real) en `src/tests/telegram-bot.test.ts`.
 - Capacidad sin relación con el canal MCP stdio: el conteo de tools (38) no cambia; validación manual pendiente contra un bot real y una cuenta de TikTok autenticada.
+
+---
+
+## DEC-026 — Telegram como único canal del usuario, con confirmación escrita para las acciones destructivas
+
+Fecha: 2026-09-30
+
+Estado: Aceptada (implementada; la voz dentro de Telegram queda para una segunda fase)
+
+Decisión: el usuario se comunica con el agente de TikTok únicamente por Telegram, escrito hoy y por voz en una segunda fase. Se descartó el modo `--voice` (página web servida al celular contra la Realtime API) que estaba implementado sin commitear: era un segundo canal, con su propia sesión, su propio gate y su propia autenticación (`VOICE_TOKEN`), para un resultado que Telegram ya cubre. Además su gate autorizaba con la voz (`input_audio_buffer.speech_started`), que es exactamente la vía que el usuario quiere descartar.
+
+Motivo: el usuario decidió que no quiere depender de tener TikTok abierto para dirigir al agente, y que el paso a voz le preocupa precisamente porque una instrucción mal oída podría ejecutar algo que no quiere. Un solo canal reduce la superficie a mantener y deja la seguridad concentrada en un único lugar.
+
+Alternativas consideradas: mantener `--voice` como canal paralelo (doble superficie de autenticación, doble gate, dos caminos de seguridad que pueden divergir); canal MCP por HTTP con el usuario como emisor (el usuario no quiere razonar él mismo, quiere delegar).
+
+Consecuencias:
+- **El gate de confirmación vive en el servidor (`src/runtime/telegram-confirm.ts`), no en el prompt.** Las tools que cambian la cuenta (`post`, `photo_post`, `delete`, `delete_comment`, `unfollow`, `playlist_manage`, `profile`, `update_avatar`, `cancel_scheduled`) nunca se ejecutan en el turno en que el modelo las pide: el bot las estaciona y responde mostrando la llamada exacta (tool + argumentos, renderizada sin LLM para que no dependa del razonamiento). Solo un "sí" escrito en un mensaje posterior la ejecuta, y autoriza **una sola** acción; un segundo "sí" no repite nada.
+- **Ningún otro mensaje ejecuta ni descarta lo estacionado.** Si el usuario escribe algo que no es un sí o un no claro, el bot repregunta y conserva la acción pendiente.
+- **Un mensaje de voz nunca autoriza.** El gate registra el origen del mensaje (`InstructionOrigin`: `text` | `voice`) y un `voice` siempre devuelve "no autorizable", de modo que la acción sigue esperando un "sí" de texto. La regla está en el modelo de tipos, no en una convención del prompt.
+- **La acción estacionada expira** (`TELEGRAM_BOT_CONFIRM_TTL_MS`, default 5 minutos) para que un "sí" tardío no dispare una intención vieja.
+- El gate es por chat: con varios chats autorizados, cada uno tiene su propia acción pendiente.
+- Se conserva `src/runtime/operation-await.ts` (extracción de la espera de operaciones async, ya usada por el bot) para no duplicar lógica; el resto de `--voice` se eliminó.
+- No se agregan tools MCP: el conteo no cambia (38).
+- 18 tests nuevos: `src/tests/telegram-confirm.test.ts` (11: clasificación del mensaje, voz que no autoriza, expiración, una confirmación = una acción, render de argumentos) y 7 casos de extremo a extremo en `src/tests/telegram-bot.test.ts` (no ejecuta en el turno, ejecuta con "sí" escrito, no repite, voz no confirma, mensaje ajeno conserva la acción, "no" descarta, expiración, lecturas sin fricción). Suite completa: 43 tests.
+- **Fase 2 pendiente**: recibir notas de voz de Telegram, transcribirlas y tratarlas como instrucciones con origen `voice`. Como el gate ya las rechaza como confirmación, la voz puede dictar acciones pero nunca autorizarlas. Requiere definir el proveedor de transcripción (API de transcripción de OpenAI o el LLM del bot).
 
 ---
 

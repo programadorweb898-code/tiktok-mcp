@@ -115,20 +115,51 @@ tiktok-mcp --telegram-bot
 
 Configuration (all optional except the token and the LLM key):
 
-| Setting                  | Description                                              |
-| ------------------------ | -------------------------------------------------------- |
-| `TELEGRAM_BOT_TOKEN`     | **Required.** Bot token from BotFather.                  |
-| `OPENAI_API_KEY`         | **Required** for the reasoning LLM.                      |
-| `TELEGRAM_CHAT_ID`       | Allow a single chat (or comma-separated list).           |
-| `TELEGRAM_ALLOWED_CHATS` | Comma-separated chat ids; overrides `TELEGRAM_CHAT_ID`.  |
-| `OPENAI_BASE_URL`        | Any OpenAI-compatible endpoint (OpenAI, Ollama, vLLM...).|
-| `TELEGRAM_BOT_MODEL`     | LLM model (default `gpt-4o-mini`).                       |
+| Setting                            | Description                                              |
+| ---------------------------------- | -------------------------------------------------------- |
+| `TELEGRAM_BOT_TOKEN`               | **Required.** Bot token from BotFather.                  |
+| `OPENAI_API_KEY`                   | **Required** for the reasoning LLM.                      |
+| `TELEGRAM_CHAT_ID`                 | Allow a single chat (or comma-separated list).           |
+| `TELEGRAM_ALLOWED_CHATS`           | Comma-separated chat ids; overrides `TELEGRAM_CHAT_ID`.  |
+| `OPENAI_BASE_URL`                  | Any OpenAI-compatible endpoint (OpenAI, Ollama, vLLM...).|
+| `TELEGRAM_BOT_MODEL`               | LLM model (default `gpt-4o-mini`).                       |
+| `TELEGRAM_BOT_OPERATION_TIMEOUT_MS`| Wait for an async operation before reporting it pending (default 90000). |
+| `TELEGRAM_BOT_CONFIRM_TTL_MS`      | How long a destructive action waits for your written "yes" (default 300000). |
 
 If no chat is authorized, the bot answers any chat. The bot exposes a subset of
 the TikTok tools (`post`, `photo_post`, `follow`, `unfollow`, `like`, `unlike`,
 `comment`, `comment_reply`, `comments`, `delete`, `profile`,
 `profile_analytics`, `studio_analytics`, `series`, `scheduled`,
 `operation_status`, `search`, `trending`, `accounts`).
+
+You don't need TikTok open: the bot drives its own persistent browser profile,
+launched on demand. Add `--headless` if you don't even want the window.
+
+### Actions that change the account need your written confirmation
+
+Publishing, deleting, unfollowing, editing the profile or a playlist never run
+on the first turn. The bot parks the call and shows you exactly what it is about
+to do:
+
+> Falta tu confirmacion para una accion que cambia la cuenta: `tiktok_post` con
+> `account_id="brand"`, `caption="primer post"`
+> Todavia no se ejecuto nada. Responde **SI** para autorizar exactamente esa
+> accion, o **NO** para descartarla.
+
+The check lives in the server, not in the prompt, so the model cannot talk its
+way past it:
+
+- only an exact written **yes** authorizes — any other message neither runs nor
+  discards the action, the bot just asks again;
+- **one yes authorizes exactly one action**, a second "yes" repeats nothing;
+- a **voice message never authorizes** — it can dictate an action, but only a
+  typed "yes" runs it;
+- the parked action **expires** (5 min by default), so a late "yes" cannot fire
+  a stale intent.
+
+Reading and analytics tools (`accounts`, `profile_analytics`, `following`,
+`followers`, `comments`, `search`, `trending`, `series`, ...) run with no
+friction.
 
 ## Hosted HTTP API
 

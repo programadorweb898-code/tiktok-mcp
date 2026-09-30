@@ -1,6 +1,8 @@
 import { TelegramClient, TelegramMessage } from "./telegram.js";
 import { LlmClient, llmConfigFromEnv, LlmRequest, LlmTurnResult } from "./llm-client.js";
 import { catalogByName, CatalogTool, catalogForPrompt } from "./tool-catalog.js";
+import { awaitOperation, isPendingOperation } from "./operation-await.js";
+import { ConfirmationGate, describeAction, InstructionOrigin } from "./telegram-confirm.js";
 import type { LocalTikTokRuntime } from "./local-runtime.js";
 
 /**
@@ -19,6 +21,8 @@ import type { LocalTikTokRuntime } from "./local-runtime.js";
  *   OPENAI_BASE_URL            — optional, OpenAI-compatible endpoint
  *   TELEGRAM_BOT_MODEL         — optional default gpt-4o-mini
  *   TELEGRAM_BOT_POLL_MS       — optional polling interval (default 1500)
+ *   TELEGRAM_BOT_OPERATION_TIMEOUT_MS — optional, how long to wait for an async TikTok operation (default 90000)
+ *   TELEGRAM_BOT_CONFIRM_TTL_MS — optional, how long a destructive action waits for a written "si" (default 300000)
  */
 
 function allowedChatSet(): Set<string> {
@@ -40,6 +44,7 @@ Reglas:
 - Use exactly one tool per turn when an action is needed. Never invent tools.
 - For reading data (accounts, analytics, comments, trending, search), call the read tool.
 - Return tool arguments as a JSON object with the exact parameter names listed.
+- Publicar, borrar, dejar de seguir, editar perfil o playlists NO se ejecutan en el mismo turno: el bot se los muestra al usuario y espera un "si" escrito. Nunca digas que la accion ya se hizo ni la des por ejecutada.
 
 Responde siempre en espanol.`;
 
@@ -48,6 +53,8 @@ export interface TelegramBotOptions {
   allowedChats?: string[];
   pollMs?: number;
   operationPollMs?: number;
+  operationTimeoutMs?: number;
+  confirmTtlMs?: number;
   fetchImpl?: typeof fetch;
   llm?: LlmClient;
   shouldRun?: (msg: TelegramMessage) => boolean;
@@ -58,7 +65,10 @@ export class TelegramBot {
   private readonly allowed: Set<string>;
   private readonly pollMs: number;
   private readonly operationPollMs: number;
+  private readonly operationTimeoutMs: number;
+  private readonly confirmTtlMs: number;
   private readonly catalog = catalogByName();
+  private readonly gates = new Map<string, ConfirmationGate>();
   private readonly llm: LlmClient | null;
   private offset = 0;
   private stopped = false;
@@ -76,12 +86,24 @@ export class TelegramBot {
       : allowedChatSet();
     this.pollMs = options.pollMs ?? (Number(process.env.TELEGRAM_BOT_POLL_MS) || 1500);
     this.operationPollMs = options.operationPollMs ?? 2_500;
+    this.operationTimeoutMs = options.operationTimeoutMs ?? (Number(process.env.TELEGRAM_BOT_OPERATION_TIMEOUT_MS) || 90_000);
+    this.confirmTtlMs = options.confirmTtlMs ?? (Number(process.env.TELEGRAM_BOT_CONFIRM_TTL_MS) || 5 * 60_000);
     this.llm = options.llm ?? (llmConfigFromEnv() ? new LlmClient(llmConfigFromEnv()!) : null);
     this.runFilter = options.shouldRun;
   }
 
   get llmReady(): boolean {
     return this.llm !== null;
+  }
+
+  private gateFor(chatId: number | string): ConfirmationGate {
+    const key = String(chatId);
+    let gate = this.gates.get(key);
+    if (!gate) {
+      gate = new ConfirmationGate(undefined, this.confirmTtlMs);
+      this.gates.set(key, gate);
+    }
+    return gate;
   }
 
   private authorized(chat: number | string): boolean {
@@ -136,16 +158,56 @@ export class TelegramBot {
   /**
    * Core reasoning loop. Exposed for tests: takes a user instruction and
    * returns the natural-language reply (after running any tool the LLM chose).
+   *
+   * Destructive tools are parked instead of run: the first turn returns a
+   * confirmation request, and the call only executes once the user answers with
+   * a written yes in a later message.
    */
-  async processInstruction(instruction: string, chatId: number | string): Promise<string> {
+  async processInstruction(
+    instruction: string,
+    chatId: number | string,
+    options: { origin?: InstructionOrigin } = {},
+  ): Promise<string> {
     if (!this.llm) return "OPENAI_API_KEY no esta configurado. No puedo razonar sin un LLM.";
+    const origin = options.origin || "text";
+    const gate = this.gateFor(chatId);
+
+    const parked = gate.pending;
+    if (parked) {
+      const verdict = gate.classify(instruction, origin);
+      if (verdict === "confirm") {
+        const action = gate.take()!;
+        const outcome = await this.runTool(action.tool, action.args);
+        return this.summarize(`El usuario confirmo por escrito: ${describeAction(action.tool, action.args)}`, action.tool, outcome);
+      }
+      if (verdict === "cancel") {
+        gate.clear();
+        return `Cancelado. No se ejecuto nada.`;
+      }
+      return this.confirmationPrompt(parked.tool, parked.args, origin);
+    }
+
     const decisions = await this.decide(instruction);
     if (decisions.toolCall) {
-      const toolOutcome = await this.runTool(decisions.toolCall.name, decisions.toolCall.arguments);
-      const summary = await this.summarize(instruction, decisions.toolCall.name, toolOutcome);
-      return summary;
+      const { name, arguments: args } = decisions.toolCall;
+      if (gate.needsConfirmation(name)) {
+        gate.open(name, args);
+        return this.confirmationPrompt(name, args, origin);
+      }
+      const toolOutcome = await this.runTool(name, args);
+      return this.summarize(instruction, name, toolOutcome);
     }
     return decisions.text || "Listo.";
+  }
+
+  private confirmationPrompt(tool: string, args: Record<string, unknown>, origin: InstructionOrigin): string {
+    const action = describeAction(tool, args);
+    if (origin !== "text") {
+      return `Recibido por voz, asi que NO lo ejecuto: ${action}. ` +
+        "Para confirmar tengo que leer un mensaje escrito: responde SI (texto) para autorizarlo, o NO para descartarlo.";
+    }
+    return `Falta tu confirmacion para una accion que cambia la cuenta: ${action}\n` +
+      "Todavia no se ejecuto nada. Responde SI para autorizar exactamente esa accion, o NO para descartarla.";
   }
 
   private async decide(instruction: string): Promise<LlmTurnResult> {
@@ -167,45 +229,19 @@ export class TelegramBot {
     if (!tool) return `Herramienta desconocida: ${name}`;
     try {
       const result = await tool.run(this.runtime, args || {});
-      const pendingOp =
-        result && typeof result === "object" && (result as any).operation_id && (result as any).status === "pending"
-          ? (result as any).operation_id
-          : null;
+      const pendingOp = isPendingOperation(result);
       if (pendingOp) {
-        return JSON.stringify(await this.awaitOperation(pendingOp), null, 2);
+        const settled = await awaitOperation(this.runtime, pendingOp, {
+          timeoutMs: this.operationTimeoutMs,
+          pollMs: this.operationPollMs,
+          sleep: (ms) => this.delay(ms),
+        });
+        return JSON.stringify(settled, null, 2);
       }
       return JSON.stringify(result, null, 2);
     } catch (error) {
       return JSON.stringify({ error: true, message: error instanceof Error ? error.message : String(error) });
     }
-  }
-
-  /**
-   * Poll an async TikTok operation until it finishes so the bot answers with
-   * the real result instead of pointing the user at tiktok_operation_status.
-   * Long-lived operations (e.g. connect, waiting on a QR scan) time out and
-   * report that they are still pending.
-   */
-  private async awaitOperation(operationId: string, timeoutMs = 90_000): Promise<Record<string, unknown>> {
-    const started = Date.now();
-    while (Date.now() - started < timeoutMs) {
-      await this.delay(this.operationPollMs);
-      const status = this.runtime.operationStatus(operationId) as any;
-      if (status.done) {
-        return {
-          operation_id: operationId,
-          status: status.status,
-          ...(status.result !== undefined ? { result: status.result } : {}),
-          ...(status.error !== undefined ? { error: status.error } : {}),
-          ...(status.error_code !== undefined ? { error_code: status.error_code } : {}),
-        };
-      }
-    }
-    return {
-      operation_id: operationId,
-      status: "pending",
-      note: "La operacion sigue en curso. Podes consultar su estado más tarde con tiktok_operation_status.",
-    };
   }
 
   private async summarize(instruction: string, toolName: string, outcome: string): Promise<string> {

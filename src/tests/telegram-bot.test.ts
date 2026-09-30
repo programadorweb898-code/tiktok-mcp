@@ -37,6 +37,8 @@ function stubLlm(decisions: LlmTurnResult[]): LlmClient {
 
 test("telegram bot: tool decision dispatches to runtime and summarizes", async () => {
   let ran = "";
+  // `done` mirrors operationView: a finished operation always reports it, so the
+  // bot stops polling instead of waiting out the whole timeout.
   const fakeRuntime = {
     follow: async ({ account_id, target_user }: any) => {
       ran = `${account_id}:${target_user}`;
@@ -45,6 +47,7 @@ test("telegram bot: tool decision dispatches to runtime and summarizes", async (
     operationStatus: () => ({
       operation_id: "op-1",
       status: "done",
+      done: true,
       result: { success: true },
     }),
   } as unknown as LocalTikTokRuntime;
@@ -53,6 +56,7 @@ test("telegram bot: tool decision dispatches to runtime and summarizes", async (
     token: "test-token",
     allowedChats: ["123"],
     operationPollMs: 1,
+    operationTimeoutMs: 200,
     llm: stubLlm([
       { toolCall: { name: "tiktok_follow", arguments: { account_id: "brand", target_user: "@x" } } },
       { text: "Listo, empece a seguir a @x en la cuenta brand." },
@@ -79,6 +83,7 @@ test("telegram bot: pending async operations are awaited and reported with the f
     token: "test-token",
     allowedChats: ["123"],
     operationPollMs: 1,
+    operationTimeoutMs: 200,
     llm: stubLlm([
       {
         toolCall: { name: "tiktok_profile_analytics", arguments: { account_id: "brand" } },
@@ -90,6 +95,29 @@ test("telegram bot: pending async operations are awaited and reported with the f
   const reply = await bot.processInstruction("A cuantas personas sigo", 123);
   assert.equal(polls, 2);
   assert.match(reply, /42/);
+});
+
+test("telegram bot: an operation that never finishes is reported as pending, not waited out", async () => {
+  const fakeRuntime = {
+    profileAnalytics: async () => ({ operation_id: "op-stuck", status: "pending" }),
+    operationStatus: () => ({ operation_id: "op-stuck", status: "running", done: false }),
+  } as unknown as LocalTikTokRuntime;
+
+  const bot = new TelegramBot(fakeRuntime, {
+    token: "test-token",
+    allowedChats: ["123"],
+    operationPollMs: 1,
+    operationTimeoutMs: 50,
+    llm: stubLlm([
+      { toolCall: { name: "tiktok_profile_analytics", arguments: { account_id: "brand" } } },
+      { text: "Sigue en curso." },
+    ]),
+  });
+
+  const started = Date.now();
+  const reply = await bot.processInstruction("A cuantas personas sigo", 123);
+  assert.ok(Date.now() - started < 5_000, "must give up on the timeout instead of hanging");
+  assert.match(reply, /en curso/i);
 });
 
 test("telegram bot: text-only reply when no tool is needed", async () => {
@@ -130,4 +158,183 @@ test("telegram bot: missing LLM config is reported instead of crashing", async (
   const reply = await bot.processInstruction("hola", 123);
   assert.match(reply, /OPENAI_API_KEY/);
   process.env.TELEGRAM_BOT_TOKEN = "test-token";
+});
+
+function publishingRuntime(calls: string[]): LocalTikTokRuntime {
+  return {
+    post: async (input: any) => {
+      calls.push(`${input.account_id}:${input.caption}`);
+      return { operation_id: "op-post", status: "pending" };
+    },
+    operationStatus: () => ({
+      operation_id: "op-post",
+      status: "done",
+      done: true,
+      result: { success: true, video_url: "https://www.tiktok.com/@brand/video/7" },
+    }),
+  } as unknown as LocalTikTokRuntime;
+}
+
+test("telegram bot: a destructive tool is parked, never run on the same turn", async () => {
+  const calls: string[] = [];
+  const bot = new TelegramBot(publishingRuntime(calls), {
+    token: "test-token",
+    allowedChats: ["123"],
+    operationPollMs: 1,
+    operationTimeoutMs: 200,
+    llm: stubLlm([
+      { toolCall: { name: "tiktok_post", arguments: { account_id: "brand", caption: "primer post" } } },
+      { text: "Publicado." },
+    ]),
+  });
+
+  const parked = await bot.processInstruction("Publica un video con el texto primer post", 123);
+  assert.deepEqual(calls, [], "the publish must not run before the user confirms");
+  assert.match(parked, /primer post/);
+  assert.match(parked, /SI/);
+  assert.doesNotMatch(parked, /Publicado/);
+});
+
+test("telegram bot: a written yes runs exactly the parked action", async () => {
+  const calls: string[] = [];
+  const bot = new TelegramBot(publishingRuntime(calls), {
+    token: "test-token",
+    allowedChats: ["123"],
+    operationPollMs: 1,
+    operationTimeoutMs: 200,
+    llm: stubLlm([
+      { toolCall: { name: "tiktok_post", arguments: { account_id: "brand", caption: "primer post" } } },
+      { text: "Listo, ya esta publicado." },
+    ]),
+  });
+
+  await bot.processInstruction("Publica un video con el texto primer post", 123);
+  const reply = await bot.processInstruction("si", 123);
+  assert.deepEqual(calls, ["brand:primer post"]);
+  assert.match(reply, /publicado/);
+});
+
+test("telegram bot: a second yes does not repeat the confirmed action", async () => {
+  const calls: string[] = [];
+  const bot = new TelegramBot(publishingRuntime(calls), {
+    token: "test-token",
+    allowedChats: ["123"],
+    operationPollMs: 1,
+    operationTimeoutMs: 200,
+    llm: stubLlm([
+      { toolCall: { name: "tiktok_post", arguments: { account_id: "brand", caption: "primer post" } } },
+      { text: "Listo, ya esta publicado." },
+      { text: "No hay nada pendiente de confirmar." },
+    ]),
+  });
+
+  await bot.processInstruction("Publica un video con el texto primer post", 123);
+  await bot.processInstruction("si", 123);
+  const reply = await bot.processInstruction("si", 123);
+  assert.deepEqual(calls, ["brand:primer post"]);
+  assert.match(reply, /nada pendiente/);
+});
+
+test("telegram bot: a voice message cannot authorize a parked action", async () => {
+  const calls: string[] = [];
+  const bot = new TelegramBot(publishingRuntime(calls), {
+    token: "test-token",
+    allowedChats: ["123"],
+    operationPollMs: 1,
+    operationTimeoutMs: 200,
+    llm: stubLlm([
+      { toolCall: { name: "tiktok_post", arguments: { account_id: "brand", caption: "primer post" } } },
+      { text: "Listo, ya esta publicado." },
+    ]),
+  });
+
+  await bot.processInstruction("Publica un video con el texto primer post", 123);
+  const reply = await bot.processInstruction("si, dale", 123, { origin: "voice" });
+  assert.deepEqual(calls, [], "a transcribed yes must not publish");
+  assert.match(reply, /escrito/i);
+});
+
+test("telegram bot: an unrelated message keeps the action parked and skips the LLM", async () => {
+  const calls: string[] = [];
+  const bot = new TelegramBot(publishingRuntime(calls), {
+    token: "test-token",
+    allowedChats: ["123"],
+    llm: stubLlm([
+      { toolCall: { name: "tiktok_post", arguments: { account_id: "brand", caption: "primer post" } } },
+    ]),
+  });
+
+  await bot.processInstruction("Publica un video con el texto primer post", 123);
+  // The stub throws when the bot asks the LLM again, so this proves the parked
+  // action short-circuits the reasoning loop instead of re-planning.
+  const reply = await bot.processInstruction("espera, mejor no", 123);
+  assert.deepEqual(calls, []);
+  assert.match(reply, /SI/);
+  assert.match(reply, /NO/);
+});
+
+test("telegram bot: a written no discards the parked action", async () => {
+  const calls: string[] = [];
+  const bot = new TelegramBot(publishingRuntime(calls), {
+    token: "test-token",
+    allowedChats: ["123"],
+    llm: stubLlm([
+      { toolCall: { name: "tiktok_post", arguments: { account_id: "brand", caption: "primer post" } } },
+      { text: "Entendido, no hay ninguna accion pendiente." },
+    ]),
+  });
+
+  await bot.processInstruction("Publica un video con el texto primer post", 123);
+  const reply = await bot.processInstruction("no", 123);
+  assert.match(reply, /Cancelado/);
+  const after = await bot.processInstruction("si", 123);
+  assert.deepEqual(calls, [], "the discarded action cannot be revived");
+  assert.match(after, /ninguna accion pendiente/, "the discarded action is gone, so the yes is a normal instruction");
+});
+
+test("telegram bot: a parked action expires instead of waiting forever", async () => {
+  const calls: string[] = [];
+  const bot = new TelegramBot(publishingRuntime(calls), {
+    token: "test-token",
+    allowedChats: ["123"],
+    confirmTtlMs: 1,
+    operationPollMs: 1,
+    operationTimeoutMs: 200,
+    llm: stubLlm([
+      { toolCall: { name: "tiktok_post", arguments: { account_id: "brand", caption: "primer post" } } },
+      { text: "Entendido, interprete tu si como una instruccion nueva." },
+    ]),
+  });
+
+  await bot.processInstruction("Publica un video con el texto primer post", 123);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const reply = await bot.processInstruction("si", 123);
+  assert.deepEqual(calls, []);
+  assert.doesNotMatch(reply, /publicado/, "the expired yes is treated as a plain instruction");
+});
+
+test("telegram bot: reads still run without any confirmation", async () => {
+  let polls = 0;
+  const fakeRuntime = {
+    profileAnalytics: async () => ({ operation_id: "op-read", status: "pending" }),
+    operationStatus: () => {
+      polls += 1;
+      return { operation_id: "op-read", status: "done", done: true, result: { profile: { counts: { followers: 7 } } } };
+    },
+  } as unknown as LocalTikTokRuntime;
+
+  const bot = new TelegramBot(fakeRuntime, {
+    token: "test-token",
+    allowedChats: ["123"],
+    operationPollMs: 1,
+    operationTimeoutMs: 200,
+    llm: stubLlm([
+      { toolCall: { name: "tiktok_profile_analytics", arguments: { account_id: "brand" } } },
+      { text: "Tenes 7 seguidores." },
+    ]),
+  });
+
+  const reply = await bot.processInstruction("Cuantos seguidores tengo", 123);
+  assert.equal(polls, 1);
+  assert.match(reply, /7 seguidores/);
 });
